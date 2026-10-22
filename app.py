@@ -125,10 +125,12 @@ def ytdlp_base_args(job_dir):
     return args
 
 
-# Urutan strategi klien YouTube untuk mengakali bot-check di IP datacenter:
-# None = bawaan yt-dlp, sisanya dicoba bergantian bila kena "Sign in to
-# confirm you're not a bot".
-PLAYER_CLIENTS = [None, "tv", "ios", "mweb", "web_safari"]
+# Urutan strategi klien YouTube untuk mengakali pembatasan di IP
+# datacenter: None = bawaan yt-dlp, sisanya dicoba bergantian setiap
+# error. android_vr & mediaconnect dikenal sering memberi format tanpa
+# token PO; tv butuh cookies login.
+PLAYER_CLIENTS = [None, "tv", "android_vr", "mediaconnect", "ios",
+                  "mweb", "web_safari"]
 
 
 def _is_bot_error(text):
@@ -166,8 +168,9 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
             return res
         tail = (res.stderr or res.stdout or "").strip().splitlines()
         last_tail = tail[-1] if tail else last_tail
-        if client:
-            log(job, "Klien " + client + " gagal, coba berikutnya…")
+        label = client or "bawaan"
+        log(job, "Klien " + label + " gagal: "
+            + (last_tail[:160] if last_tail else "?"))
     raise RuntimeError(errlabel + ": " + last_tail)
 
 
