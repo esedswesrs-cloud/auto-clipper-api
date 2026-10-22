@@ -167,14 +167,16 @@ def _is_retryable(text):
     )
 
 
-def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
-    """Jalankan yt-dlp melewati daftar ATTEMPTS (klien, pakai cookies).
+def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False,
+              attempts=None):
+    """Jalankan yt-dlp melewati daftar percobaan (klien, pakai cookies).
 
     Error apa pun -> percobaan berikutnya. verbose=True menyaring
     baris terkait PO Token dari stderr ke log (diagnosis bgutil).
+    Percobaan yang menang dicatat di job["win_attempt"].
     """
     last_tail = "kesalahan tidak diketahui"
-    for client, use_cookies in ATTEMPTS:
+    for client, use_cookies in (attempts or ATTEMPTS):
         if use_cookies and not os.environ.get(
                 "YOUTUBE_COOKIES", "").strip():
             continue
@@ -202,6 +204,7 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
                     "(klien " + label + ")")
         if res.returncode == 0:
             log(job, "Lolos via klien " + label + ".")
+            job["win_attempt"] = (client, use_cookies)
             return res
         lines = (res.stderr or res.stdout or "").strip().splitlines()
         err_lines = [ln for ln in lines if "ERROR" in ln]
@@ -300,7 +303,85 @@ def fetch_transcript(job, info, job_dir):
         return []
 
 
-def download_video(job, url, job_dir):
+def _http_download(job, fmt_entry, dest):
+    """Unduh satu format langsung dari URL hasil ekstraksi info."""
+    headers = dict(fmt_entry.get("http_headers") or {})
+    headers.setdefault("User-Agent", "Mozilla/5.0")
+    with requests.get(fmt_entry["url"], headers=headers, stream=True,
+                      timeout=60) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    return dest
+
+
+def _download_from_info(job, info, job_dir):
+    """Unduh memakai URL format dari info yang SUDAH berhasil diambil.
+
+    Ekstraksi ulang untuk unduh sering kena 403 googlevideo; URL dari
+    info yang sukses membawa tanda tangan (dan token) yang sama dengan
+    sesi ekstaksinya, jadi diunduh langsung lewat HTTP.
+    """
+    formats = [f for f in (info.get("formats") or []) if f.get("url")]
+
+    def h(f):
+        return f.get("height") or 0
+
+    muxed = [f for f in formats
+             if f.get("vcodec") not in (None, "none")
+             and f.get("acodec") not in (None, "none")
+             and h(f) <= 720]
+    videos = [f for f in formats
+              if f.get("vcodec") not in (None, "none")
+              and f.get("acodec") in (None, "none") and h(f) <= 720]
+    audios = [f for f in formats
+              if f.get("acodec") not in (None, "none")
+              and f.get("vcodec") in (None, "none")]
+    muxed.sort(key=h, reverse=True)
+    videos.sort(key=h, reverse=True)
+    audios.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+
+    if muxed:
+        f = muxed[0]
+        log(job, "Unduh langsung format {} ({}p, {}).".format(
+            f.get("format_id"), h(f), f.get("protocol")))
+        dest = os.path.join(job_dir, "source.mp4")
+        _http_download(job, f, dest)
+        return dest
+    if videos and audios:
+        v, a = videos[0], audios[0]
+        log(job, "Unduh langsung format video {} ({}p, {}) + audio {}."
+            .format(v.get("format_id"), h(v), v.get("protocol"),
+                    a.get("format_id")))
+        vpath = os.path.join(job_dir, "source_v.bin")
+        apath = os.path.join(job_dir, "source_a.bin")
+        _http_download(job, v, vpath)
+        _http_download(job, a, apath)
+        dest = os.path.join(job_dir, "source.mp4")
+        res = run_cmd(["ffmpeg", "-y", "-i", vpath, "-i", apath,
+                       "-c", "copy", dest], timeout=600)
+        if res.returncode != 0 or not os.path.exists(dest):
+            raise RuntimeError("Gagal menggabungkan video+audio.")
+        return dest
+    raise RuntimeError("Info video tidak membawa format yang bisa "
+                       "diunduh langsung.")
+
+
+def download_video(job, url, job_dir, info=None):
+    # Cara utama: unduh langsung dari URL info yang sukses.
+    if info:
+        try:
+            return _download_from_info(job, info, job_dir)
+        except Exception as e:
+            log(job, "Unduh langsung gagal ({}), coba yt-dlp…".format(
+                str(e)[:120]))
+    # Cadangan: yt-dlp, utamakan percobaan yang menang saat ambil info.
+    attempts = None
+    win = job.get("win_attempt")
+    if win:
+        attempts = [win] + [a for a in ATTEMPTS if a != win]
     out = os.path.join(job_dir, "source.%(ext)s")
     fmt = (
         "best[height<=720][ext=mp4]/best[height<=720]/"
@@ -311,7 +392,8 @@ def download_video(job, url, job_dir):
         "--merge-output-format", "mp4",
         "-o", out,
         url,
-    ], timeout=1200, errlabel="yt-dlp gagal mengunduh video")
+    ], timeout=1200, errlabel="yt-dlp gagal mengunduh video",
+        attempts=attempts)
     for name in sorted(os.listdir(job_dir)):
         if name.startswith("source."):
             return os.path.join(job_dir, name)
@@ -547,7 +629,7 @@ def process_job(job, url, gemini_key, settings):
         set_progress(job, 15)
 
         log(job, "Mengunduh video…")
-        src = download_video(job, url, job_dir)
+        src = download_video(job, url, job_dir, info=info)
         set_progress(job, 40)
 
         log(job, "Membaca transkrip…")
