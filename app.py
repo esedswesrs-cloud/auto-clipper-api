@@ -775,6 +775,34 @@ def debug_bgutil():
         return jsonify({"reachable": False, "error": str(e)[:200]})
 
 
+@app.get("/api/debug/egress")
+def debug_egress():
+    """Bandingkan egress langsung vs lewat proxy (WARP).
+
+    Memakai jejak Cloudflare: warp=on berarti keluar lewat WARP.
+    """
+    out = {"proxy_configured": PROXY_URL or None}
+    url = "https://www.cloudflare.com/cdn-cgi/trace"
+    for label, proxies in (("direct", None),
+                           ("via_proxy", {"http": PROXY_URL,
+                                          "https": PROXY_URL}
+                            if PROXY_URL else None)):
+        if label == "via_proxy" and not PROXY_URL:
+            continue
+        try:
+            r = requests.get(url, timeout=10, proxies=proxies)
+            info = {}
+            for ln in (r.text or "").splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    if k in ("ip", "warp", "loc"):
+                        info[k] = v
+            out[label] = info
+        except Exception as e:
+            out[label] = {"error": str(e)[:160]}
+    return jsonify(out)
+
+
 @app.post("/api/job")
 def create_job():
     data = request.get_json(force=True, silent=True) or {}
