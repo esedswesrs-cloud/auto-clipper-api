@@ -136,6 +136,12 @@ def _is_bot_error(text):
     return "sign in to confirm" in t or "not a bot" in t
 
 
+def _is_retryable(text):
+    """Error yang layak dicoba ulang dengan player client lain."""
+    t = (text or "").lower()
+    return _is_bot_error(t) or "requested format is not available" in t
+
+
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
     """Jalankan yt-dlp; bila kena bot-check, coba player client berikutnya."""
     last_tail = "kesalahan tidak diketahui"
@@ -152,10 +158,10 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
             return res
         tail = (res.stderr or res.stdout or "").strip().splitlines()
         last_tail = tail[-1] if tail else last_tail
-        if _is_bot_error(res.stderr) or _is_bot_error(res.stdout):
+        if _is_retryable(res.stderr) or _is_retryable(res.stdout):
             if client:
                 log(job, "Klien " + client
-                    + " kena bot-check, coba berikutnya…")
+                    + " gagal, coba berikutnya…")
             continue
         raise RuntimeError(errlabel + ": " + last_tail)
     raise RuntimeError(errlabel + ": " + last_tail)
