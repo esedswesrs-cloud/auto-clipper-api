@@ -125,16 +125,46 @@ def ytdlp_base_args(job_dir):
     return args
 
 
+# Urutan strategi klien YouTube untuk mengakali bot-check di IP datacenter:
+# None = bawaan yt-dlp, sisanya dicoba bergantian bila kena "Sign in to
+# confirm you're not a bot".
+PLAYER_CLIENTS = [None, "tv", "ios", "mweb", "web_safari"]
+
+
+def _is_bot_error(text):
+    t = (text or "").lower()
+    return "sign in to confirm" in t or "not a bot" in t
+
+
+def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
+    """Jalankan yt-dlp; bila kena bot-check, coba player client berikutnya."""
+    last_tail = "kesalahan tidak diketahui"
+    for client in PLAYER_CLIENTS:
+        args = ytdlp_base_args(job_dir)
+        if client:
+            args += ["--extractor-args",
+                     "youtube:player_client=" + client]
+        res = run_cmd(args + tail_args, timeout=timeout)
+        if res.returncode == 0:
+            if client:
+                log(job, "Lolos bot-check YouTube via klien "
+                    + client + ".")
+            return res
+        tail = (res.stderr or res.stdout or "").strip().splitlines()
+        last_tail = tail[-1] if tail else last_tail
+        if _is_bot_error(res.stderr) or _is_bot_error(res.stdout):
+            if client:
+                log(job, "Klien " + client
+                    + " kena bot-check, coba berikutnya…")
+            continue
+        raise RuntimeError(errlabel + ": " + last_tail)
+    raise RuntimeError(errlabel + ": " + last_tail)
+
+
 def fetch_info(job, url, job_dir):
     """Ambil metadata video (judul, durasi, heatmap) tanpa mengunduh."""
-    cmd = ytdlp_base_args(job_dir) + ["-J", url]
-    res = run_cmd(cmd, timeout=180)
-    if res.returncode != 0:
-        tail = (res.stderr or res.stdout or "").strip().splitlines()
-        raise RuntimeError(
-            "yt-dlp gagal mengambil info video: "
-            + (tail[-1] if tail else "kesalahan tidak diketahui")
-        )
+    res = run_ytdlp(job, job_dir, ["-J", url], timeout=180,
+                    errlabel="yt-dlp gagal mengambil info video")
     info = json.loads(res.stdout)
     return info
 
@@ -224,19 +254,12 @@ def download_video(job, url, job_dir):
         "best[height<=720][ext=mp4]/best[height<=720]/"
         "bestvideo[height<=720]+bestaudio/best"
     )
-    cmd = ytdlp_base_args(job_dir) + [
+    run_ytdlp(job, job_dir, [
         "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", out,
         url,
-    ]
-    res = run_cmd(cmd, timeout=1200)
-    if res.returncode != 0:
-        tail = (res.stderr or "").strip().splitlines()
-        raise RuntimeError(
-            "yt-dlp gagal mengunduh video: "
-            + (tail[-1] if tail else "kesalahan tidak diketahui")
-        )
+    ], timeout=1200, errlabel="yt-dlp gagal mengunduh video")
     for name in sorted(os.listdir(job_dir)):
         if name.startswith("source."):
             return os.path.join(job_dir, name)
