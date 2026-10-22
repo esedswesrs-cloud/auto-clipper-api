@@ -18,7 +18,7 @@ import uuid
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.1"
+APP_VER = "1.2"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -584,6 +584,73 @@ def hook_for_segment(segs, cand, title):
     return title
 
 
+# ---------------------------------------------------------------- STT
+def groq_transcribe(job, src, job_dir, groq_key, total_duration):
+    """Transkrip audio pakai Groq Whisper (dipakai bila video tak
+    punya transkrip YouTube dan caption aktif).
+
+    Audio diekstrak mono 32kbps lalu dipotong per 20 menit (batas
+    berkas Groq 25MB). Mengembalikan (segments, words) dengan
+    timestamp detik; words = [{start, end, text}] per kata.
+    Key hanya dipakai di header Authorization, tidak pernah dicatat.
+    """
+    words = []
+    chunk_len = 1200.0
+    n_chunks = max(1, int(total_duration // chunk_len) + 1)
+    for ci in range(n_chunks):
+        start = ci * chunk_len
+        if start >= total_duration:
+            break
+        audio = os.path.join(job_dir, "stt_{}.mp3".format(ci))
+        cmd = ["ffmpeg", "-y", "-ss", "{:.1f}".format(start),
+               "-t", "{:.1f}".format(chunk_len), "-i", src,
+               "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", audio]
+        res = run_cmd(cmd, timeout=600)
+        if res.returncode != 0 or not os.path.exists(audio):
+            raise RuntimeError("ekstrak audio gagal")
+        try:
+            with open(audio, "rb") as fh:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": "Bearer " + groq_key},
+                    files={"file": ("audio.mp3", fh, "audio/mpeg")},
+                    data={"model": "whisper-large-v3-turbo",
+                          "response_format": "verbose_json",
+                          "timestamp_granularities[]": ["word", "segment"]},
+                    timeout=600,
+                )
+        finally:
+            try:
+                os.remove(audio)
+            except OSError:
+                pass
+        if r.status_code != 200:
+            raise RuntimeError("Groq HTTP {}".format(r.status_code))
+        data = r.json()
+        for w in data.get("words") or []:
+            txt = (w.get("word") or "").strip()
+            if not txt:
+                continue
+            words.append({
+                "start": start + float(w.get("start", 0)),
+                "end": start + float(w.get("end", 0)),
+                "text": txt,
+            })
+    # kelompokkan kata menjadi segmen untuk hook/pemilih momen
+    segs = []
+    cur = None
+    for w in words:
+        if (cur is None or w["start"] - cur["end"] > 0.8
+                or w["end"] - cur["start"] > 4.0
+                or len(cur["text"].split()) >= 12):
+            cur = {"start": w["start"], "end": w["end"], "text": w["text"]}
+            segs.append(cur)
+        else:
+            cur["end"] = w["end"]
+            cur["text"] += " " + w["text"]
+    return segs, words
+
+
 # ---------------------------------------------------------------- ffmpeg
 def sanitize_drawtext(text):
     """Bersihkan teks agar aman untuk filter drawtext ffmpeg."""
@@ -642,17 +709,26 @@ def _ass_time(sec):
     return "{}:{:02d}:{:05.2f}".format(h, m, s)
 
 
-def build_clip_ass(segs, cand, settings, job_dir, idx):
+def build_clip_ass(segs, cand, settings, job_dir, idx, words=None):
     """Buat berkas .ass caption viral per-kata untuk satu klip.
 
     Kata-kata dari segmen transkrip yang tumpang tindih dengan jendela
     klip dikelompokkan 3-4 kata per baris; tiap kata diberi tag karaoke
     \\kf sehingga kata yang sedang diucapkan menyala (gaya klip viral).
     Waktu per kata ditimbang dari panjang katanya di dalam segmen.
+    Bila `words` diberikan (hasil STT Groq, timestamp per kata asli),
+    kata-kata itu dipakai langsung tanpa ditimbang ulang.
     Mengembalikan path berkas, atau None bila tak ada teks.
     """
-    words = []  # (start_rel, end_rel, text)
-    for s in segs:
+    clip_words = []  # (start_rel, end_rel, text)
+    if words:
+        for w in words:
+            if w["end"] <= cand["start"] or w["start"] >= cand["end"]:
+                continue
+            txt = w["text"].replace("{", "(").replace("}", ")")
+            clip_words.append((max(0.0, w["start"] - cand["start"]),
+                               w["end"] - cand["start"], txt))
+    for s in ([] if words else segs):
         if s["end"] <= cand["start"] or s["start"] >= cand["end"]:
             continue
         parts = [w for w in re.split(r"\s+", s["text"].strip()) if w]
@@ -665,9 +741,10 @@ def build_clip_ass(segs, cand, settings, job_dir, idx):
         span = max(0.1, seg_end - t)
         for w in parts:
             d = max(0.06, span * len(w) / total)
-            words.append((t - cand["start"], t - cand["start"] + d, w))
+            clip_words.append((t - cand["start"],
+                               t - cand["start"] + d, w))
             t += d
-    if not words:
+    if not clip_words:
         return None
 
     style_name = settings.get("captionStyle", "pop")
@@ -724,7 +801,7 @@ def build_clip_ass(segs, cand, settings, job_dir, idx):
         lines.append("Dialogue: 0,{},{},Viral,,0,0,0,,{}".format(
             _ass_time(start), _ass_time(end), " ".join(pieces)))
 
-    for item in words:
+    for item in clip_words:
         if chunk and (len(chunk) >= 4 or item[1] - chunk_start > 2.4):
             flush()
             chunk = []
@@ -779,7 +856,7 @@ def cut_clip(src, dst, cand, settings, ass_path=None):
 
 
 # ---------------------------------------------------------------- pipeline
-def process_job(job, url, gemini_key, settings):
+def process_job(job, url, gemini_key, settings, groq_key=None):
     job_dir = os.path.join(BASE_DIR, job["id"])
     os.makedirs(job_dir, exist_ok=True)
     try:
@@ -803,8 +880,24 @@ def process_job(job, url, gemini_key, settings):
 
         log(job, "Membaca transkrip…")
         segs = fetch_transcript(job, info, job_dir)
+        stt_words = None
         if segs:
             log(job, "Transkrip ditemukan ({} segmen).".format(len(segs)))
+        elif settings.get("captions") and groq_key:
+            log(job, "Transkrip kosong — memakai AI speech-to-text "
+                     "(Groq)…")
+            try:
+                segs, stt_words = groq_transcribe(
+                    job, src, job_dir, groq_key, duration)
+                if segs:
+                    log(job, "STT Groq selesai ({} kata).".format(
+                        len(stt_words)))
+                else:
+                    log(job, "STT Groq tidak menghasilkan teks.")
+            except Exception as e:  # noqa: BLE001
+                segs, stt_words = [], None
+                log(job, "STT Groq gagal ({}); klip tanpa "
+                         "caption.".format(e))
         else:
             log(job, "Transkrip tidak tersedia.")
         set_progress(job, 50)
@@ -876,7 +969,8 @@ def process_job(job, url, gemini_key, settings):
             if settings.get("captions") and segs:
                 try:
                     ass_path = build_clip_ass(segs, cand, settings,
-                                              job_dir, i)
+                                              job_dir, i,
+                                              words=stt_words)
                 except Exception:
                     ass_path = None
             if not cut_clip(src, dst, cand, settings, ass_path=ass_path):
@@ -974,11 +1068,12 @@ def create_job():
     if settings["maxDur"] < settings["minDur"]:
         settings["maxDur"] = settings["minDur"]
     gemini_key = (data.get("geminiKey") or "").strip() or None
+    groq_key = (data.get("groqKey") or "").strip() or None
 
     cleanup_old_jobs()
     job = new_job()
     t = threading.Thread(
-        target=process_job, args=(job, url, gemini_key, settings),
+        target=process_job, args=(job, url, gemini_key, settings, groq_key),
         daemon=True,
     )
     t.start()
