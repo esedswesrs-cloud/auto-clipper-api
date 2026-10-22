@@ -20,6 +20,9 @@ from flask import Flask, jsonify, request, send_from_directory
 
 APP_VER = "1.0"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
+# Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
+# Set env CLIP_PROXY="" untuk mematikan.
+PROXY_URL = os.environ.get("CLIP_PROXY", "socks5h://127.0.0.1:1080")
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
@@ -116,6 +119,10 @@ def _cookies_to_netscape(content):
 def ytdlp_base_args(job_dir, use_cookies=True):
     """Argumen dasar yt-dlp.
 
+    - Proxy SOCKS5 (WARP via wireproxy, disiapkan start.sh): SEMUA
+      trafik yt-dlp keluar lewat IP Cloudflare WARP karena IP
+      datacenter Render diblokir YouTube. Kosongkan env CLIP_PROXY
+      untuk mematikan.
     - JS runtime (Deno/Node) + remote component EJS: WAJIB sejak
       yt-dlp modern — tanpa runtime JS, tantangan n-challenge YouTube
       tak terselesaikan dan format video jadi kosong.
@@ -125,6 +132,8 @@ def ytdlp_base_args(job_dir, use_cookies=True):
             "--no-warnings",
             "--js-runtimes", "deno", "--js-runtimes", "node",
             "--remote-components", "ejs:github"]
+    if PROXY_URL:
+        args += ["--proxy", PROXY_URL]
     cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if use_cookies and cookies_content:
         cpath = os.path.join(job_dir, "cookies.txt")
@@ -327,8 +336,10 @@ def _http_download(job, fmt_entry, dest):
         return dest
     headers = dict(fmt_entry.get("http_headers") or {})
     headers.setdefault("User-Agent", "Mozilla/5.0")
+    proxies = ({"http": PROXY_URL, "https": PROXY_URL}
+               if PROXY_URL else None)
     with requests.get(fmt_entry["url"], headers=headers, stream=True,
-                      timeout=60) as r:
+                      timeout=60, proxies=proxies) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -344,7 +355,12 @@ def _download_from_info(job, info, job_dir):
     info yang sukses membawa tanda tangan (dan token) yang sama dengan
     sesi ekstaksinya, jadi diunduh langsung lewat HTTP.
     """
-    formats = [f for f in (info.get("formats") or []) if f.get("url")]
+    # Format HLS (m3u8) dikeluarkan dari unduh langsung: ffmpeg di sini
+    # tidak bisa lewat proxy SOCKS, biar ditangani pengunduh HLS bawaan
+    # yt-dlp pada jalur cadangan (yang menghormati --proxy).
+    formats = [f for f in (info.get("formats") or [])
+               if f.get("url") and "m3u8" not in (f.get("protocol")
+                                                  or "")]
 
     def h(f):
         return f.get("height") or 0

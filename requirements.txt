@@ -3,3 +3,4 @@ yt-dlp[default]
 requests>=2.31
 gunicorn>=21.2
 bgutil-ytdlp-pot-provider>=1.0
+PySocks>=1.7

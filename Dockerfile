@@ -23,12 +23,21 @@ RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider 
     && npm install --no-audit --no-fund \
     && npx tsc
 
+# wireproxy (SOCKS5 userspace dari tunnel WireGuard) + wgcf
+# (pembuat profil Cloudflare WARP) — egress bersih untuk YouTube.
+RUN curl -fsSL https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz -o /tmp/wireproxy.tar.gz \
+    && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+    && rm /tmp/wireproxy.tar.gz \
+    && curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64 -o /usr/local/bin/wgcf \
+    && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY start.sh .
 
 ENV PORT=10000
 EXPOSE 10000
-CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --port 4416 > /tmp/bgutil.log 2>&1 & sleep 3; gunicorn -w 1 -t 1800 --bind 0.0.0.0:${PORT:-10000} app:app"]
+CMD ["sh", "/app/start.sh"]
