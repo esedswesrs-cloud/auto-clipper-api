@@ -147,7 +147,12 @@ def _is_retryable(text):
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
-    """Jalankan yt-dlp; bila kena bot-check, coba player client berikutnya."""
+    """Jalankan yt-dlp; error apa pun -> coba player client berikutnya.
+
+    YouTube di IP datacenter rewelnya beda-beda per klien (bot-check,
+    format hilang, page reload, player response kosong) dan berubah-ubah,
+    jadi semua kegagalan dianggap layak dicoba ulang dengan klien lain.
+    """
     last_tail = "kesalahan tidak diketahui"
     for client in PLAYER_CLIENTS:
         args = ytdlp_base_args(job_dir)
@@ -157,17 +162,12 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
         res = run_cmd(args + tail_args, timeout=timeout)
         if res.returncode == 0:
             if client:
-                log(job, "Lolos bot-check YouTube via klien "
-                    + client + ".")
+                log(job, "Lolos via klien " + client + ".")
             return res
         tail = (res.stderr or res.stdout or "").strip().splitlines()
         last_tail = tail[-1] if tail else last_tail
-        if _is_retryable(res.stderr) or _is_retryable(res.stdout):
-            if client:
-                log(job, "Klien " + client
-                    + " gagal, coba berikutnya…")
-            continue
-        raise RuntimeError(errlabel + ": " + last_tail)
+        if client:
+            log(job, "Klien " + client + " gagal, coba berikutnya…")
     raise RuntimeError(errlabel + ": " + last_tail)
 
 
