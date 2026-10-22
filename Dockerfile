@@ -5,11 +5,16 @@ FROM python:3.12-slim
 # membuka format video untuk yt-dlp di IP datacenter).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg fonts-dejavu-core git curl xz-utils ca-certificates \
+        ffmpeg fonts-dejavu-core git curl xz-utils ca-certificates unzip \
     && curl -fsSL https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno: JS runtime untuk yt-dlp (penyelesai tantangan n-challenge
+# YouTube; tanpa ini format video bisa kosong di server).
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && deno --version
 
 # Server bgutil: dibangun sekali saat build, jalan di port 4416
 # berdampingan dengan gunicorn; plugin yt-dlp menemukannya otomatis.

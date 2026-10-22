@@ -113,11 +113,20 @@ def _cookies_to_netscape(content):
     return "\n".join(lines) + "\n"
 
 
-def ytdlp_base_args(job_dir):
-    """Argumen dasar yt-dlp, termasuk cookies dari env YOUTUBE_COOKIES."""
-    args = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings"]
+def ytdlp_base_args(job_dir, use_cookies=True):
+    """Argumen dasar yt-dlp.
+
+    - JS runtime (Deno/Node) + remote component EJS: WAJIB sejak
+      yt-dlp modern — tanpa runtime JS, tantangan n-challenge YouTube
+      tak terselesaikan dan format video jadi kosong.
+    - Cookies dari env YOUTUBE_COOKIES hanya bila use_cookies=True.
+    """
+    args = [sys.executable, "-m", "yt_dlp", "--no-playlist",
+            "--no-warnings",
+            "--js-runtimes", "deno", "--js-runtimes", "node",
+            "--remote-components", "ejs:github"]
     cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if cookies_content:
+    if use_cookies and cookies_content:
         cpath = os.path.join(job_dir, "cookies.txt")
         with open(cpath, "w", encoding="utf-8") as f:
             f.write(_cookies_to_netscape(cookies_content))
@@ -125,12 +134,22 @@ def ytdlp_base_args(job_dir):
     return args
 
 
-# Urutan strategi klien YouTube untuk mengakali pembatasan di IP
-# datacenter: None = bawaan yt-dlp, sisanya dicoba bergantian setiap
-# error. android_vr & mediaconnect dikenal sering memberi format tanpa
-# token PO; tv butuh cookies login.
-PLAYER_CLIENTS = [None, "tv", "android_vr", "mediaconnect", "ios",
-                  "mweb", "web_safari"]
+# Strategi percobaan (klien, pakai_cookies) untuk IP datacenter,
+# mengikuti PO Token Guide resmi yt-dlp:
+# Fase 1 LOGGED-OUT dulu — mweb + PO Token bgutil adalah resep utama;
+#   android_vr/visionos/web_safari dikenal memberi format tanpa PO
+#   (web_safari berupa HLS yang tak butuh n-challenge).
+# Fase 2 pakai cookies login — klien web & tv (format tv ter-DRM
+#   tanpa cookies, jadi fase ini memang butuh cookies).
+ATTEMPTS = [
+    ("mweb", False),
+    ("android_vr", False),
+    ("visionos", False),
+    ("web_safari", False),
+    (None, True),
+    ("mweb", True),
+    ("tv", True),
+]
 
 
 def _is_bot_error(text):
@@ -149,23 +168,25 @@ def _is_retryable(text):
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
-    """Jalankan yt-dlp; error apa pun -> coba player client berikutnya.
+    """Jalankan yt-dlp melewati daftar ATTEMPTS (klien, pakai cookies).
 
-    YouTube di IP datacenter rewelnya beda-beda per klien (bot-check,
-    format hilang, page reload, player response kosong) dan berubah-ubah,
-    jadi semua kegagalan dianggap layak dicoba ulang dengan klien lain.
-    verbose=True menyaring baris terkait PO Token dari stderr ke log
-    (diagnosis bgutil).
+    Error apa pun -> percobaan berikutnya. verbose=True menyaring
+    baris terkait PO Token dari stderr ke log (diagnosis bgutil).
     """
     last_tail = "kesalahan tidak diketahui"
-    for client in PLAYER_CLIENTS:
-        args = ytdlp_base_args(job_dir)
+    for client, use_cookies in ATTEMPTS:
+        if use_cookies and not os.environ.get(
+                "YOUTUBE_COOKIES", "").strip():
+            continue
+        args = ytdlp_base_args(job_dir, use_cookies=use_cookies)
         if verbose:
             args += ["--verbose"]
         if client:
             args += ["--extractor-args",
                      "youtube:player_client=" + client]
         res = run_cmd(args + tail_args, timeout=timeout)
+        label = (client or "web") + ("/cookies" if use_cookies
+                                     else "/tanpa-cookies")
         if verbose:
             noise = ("script path doesn't exist", "no server_home",
                      "po token providers:", "po token cache")
@@ -178,14 +199,14 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
                 log(job, "[pot] " + ln[:200])
             if not pot_lines:
                 log(job, "[pot] tidak ada baris PO Token di output "
-                    "(klien " + (client or "bawaan") + ")")
+                    "(klien " + label + ")")
         if res.returncode == 0:
-            if client:
-                log(job, "Lolos via klien " + client + ".")
+            log(job, "Lolos via klien " + label + ".")
             return res
-        tail = (res.stderr or res.stdout or "").strip().splitlines()
-        last_tail = tail[-1] if tail else last_tail
-        label = client or "bawaan"
+        lines = (res.stderr or res.stdout or "").strip().splitlines()
+        err_lines = [ln for ln in lines if "ERROR" in ln]
+        last_tail = (err_lines[-1] if err_lines
+                     else (lines[-1] if lines else last_tail))
         log(job, "Klien " + label + " gagal: "
             + (last_tail[:160] if last_tail else "?"))
     raise RuntimeError(errlabel + ": " + last_tail)

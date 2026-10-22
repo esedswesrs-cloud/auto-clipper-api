@@ -1,5 +1,5 @@
 flask>=3.0
-yt-dlp>=2024.8.6
+yt-dlp[default]
 requests>=2.31
 gunicorn>=21.2
 bgutil-ytdlp-pot-provider>=1.0
