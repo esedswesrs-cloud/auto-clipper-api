@@ -139,7 +139,11 @@ def _is_bot_error(text):
 def _is_retryable(text):
     """Error yang layak dicoba ulang dengan player client lain."""
     t = (text or "").lower()
-    return _is_bot_error(t) or "requested format is not available" in t
+    return (
+        _is_bot_error(t)
+        or "requested format is not available" in t
+        or "page needs to be reloaded" in t
+    )
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
