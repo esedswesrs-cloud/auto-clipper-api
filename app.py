@@ -148,20 +148,34 @@ def _is_retryable(text):
     )
 
 
-def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
+def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
     """Jalankan yt-dlp; error apa pun -> coba player client berikutnya.
 
     YouTube di IP datacenter rewelnya beda-beda per klien (bot-check,
     format hilang, page reload, player response kosong) dan berubah-ubah,
     jadi semua kegagalan dianggap layak dicoba ulang dengan klien lain.
+    verbose=True menyaring baris terkait PO Token dari stderr ke log
+    (diagnosis bgutil).
     """
     last_tail = "kesalahan tidak diketahui"
     for client in PLAYER_CLIENTS:
         args = ytdlp_base_args(job_dir)
+        if verbose:
+            args += ["--verbose"]
         if client:
             args += ["--extractor-args",
                      "youtube:player_client=" + client]
         res = run_cmd(args + tail_args, timeout=timeout)
+        if verbose:
+            pot_lines = [
+                ln.strip() for ln in (res.stderr or "").splitlines()
+                if "pot" in ln.lower() or "bgutil" in ln.lower()
+            ]
+            for ln in pot_lines[:8]:
+                log(job, "[pot] " + ln[:200])
+            if not pot_lines:
+                log(job, "[pot] tidak ada baris PO Token di output "
+                    "(klien " + (client or "bawaan") + ")")
         if res.returncode == 0:
             if client:
                 log(job, "Lolos via klien " + client + ".")
@@ -177,7 +191,8 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel):
 def fetch_info(job, url, job_dir):
     """Ambil metadata video (judul, durasi, heatmap) tanpa mengunduh."""
     res = run_ytdlp(job, job_dir, ["-J", url], timeout=180,
-                    errlabel="yt-dlp gagal mengambil info video")
+                    errlabel="yt-dlp gagal mengambil info video",
+                    verbose=True)
     info = json.loads(res.stdout)
     return info
 
