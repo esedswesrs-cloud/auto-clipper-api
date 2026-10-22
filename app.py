@@ -147,6 +147,9 @@ ATTEMPTS = [
     ("visionos", False),
     ("web_safari", False),
     (None, True),
+    ("web_embedded", True),
+    ("tv_downgraded", True),
+    ("web_creator", True),
     ("mweb", True),
     ("tv", True),
 ]
@@ -304,7 +307,24 @@ def fetch_transcript(job, info, job_dir):
 
 
 def _http_download(job, fmt_entry, dest):
-    """Unduh satu format langsung dari URL hasil ekstraksi info."""
+    """Unduh satu format langsung dari URL hasil ekstraksi info.
+
+    Format HLS (m3u8, khas klien TV/embedded) diambil pakai ffmpeg
+    karena isinya playlist segmen, bukan satu berkas.
+    """
+    proto = fmt_entry.get("protocol") or ""
+    if "m3u8" in proto:
+        hdrs = "".join("{}: {}\r\n".format(k, v)
+                       for k, v in (fmt_entry.get("http_headers")
+                                    or {}).items())
+        cmd = ["ffmpeg", "-y"]
+        if hdrs:
+            cmd += ["-headers", hdrs]
+        cmd += ["-i", fmt_entry["url"], "-c", "copy", dest]
+        res = run_cmd(cmd, timeout=1200)
+        if res.returncode != 0 or not os.path.exists(dest):
+            raise RuntimeError("ffmpeg gagal mengambil HLS.")
+        return dest
     headers = dict(fmt_entry.get("http_headers") or {})
     headers.setdefault("User-Agent", "Mozilla/5.0")
     with requests.get(fmt_entry["url"], headers=headers, stream=True,
