@@ -167,11 +167,14 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False):
                      "youtube:player_client=" + client]
         res = run_cmd(args + tail_args, timeout=timeout)
         if verbose:
+            noise = ("script path doesn't exist", "no server_home",
+                     "po token providers:", "po token cache")
             pot_lines = [
                 ln.strip() for ln in (res.stderr or "").splitlines()
-                if "pot" in ln.lower() or "bgutil" in ln.lower()
+                if ("pot" in ln.lower() or "bgutil" in ln.lower())
+                and not any(n in ln.lower() for n in noise)
             ]
-            for ln in pot_lines[:8]:
+            for ln in pot_lines[:12]:
                 log(job, "[pot] " + ln[:200])
             if not pot_lines:
                 log(job, "[pot] tidak ada baris PO Token di output "
@@ -620,6 +623,17 @@ def process_job(job, url, gemini_key, settings):
 def index():
     return jsonify({"status": "ok", "service": "auto-clipper",
                     "version": APP_VER})
+
+
+@app.get("/api/debug/bgutil")
+def debug_bgutil():
+    """Cek server bgutil (generator PO Token) hidup di 127.0.0.1:4416."""
+    try:
+        r = requests.get("http://127.0.0.1:4416/ping", timeout=4)
+        return jsonify({"reachable": True, "status_code": r.status_code,
+                        "body": (r.text or "")[:200]})
+    except Exception as e:
+        return jsonify({"reachable": False, "error": str(e)[:200]})
 
 
 @app.post("/api/job")
