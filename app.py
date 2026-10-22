@@ -18,7 +18,7 @@ import uuid
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.0"
+APP_VER = "1.1"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -621,41 +621,160 @@ def build_filter(ratio, height, teaser_text, teaser_seconds):
     return ",".join(parts)
 
 
-def cut_clip(src, dst, cand, settings):
-    """Potong satu segmen dengan ffmpeg. True bila sukses."""
-    vf = build_filter(
-        settings["ratio"], settings["height"],
-        cand.get("hook") if settings.get("teaser") else None,
-        settings.get("teaserSeconds", 3),
-    )
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", "{:.2f}".format(cand["start"]),
-        "-to", "{:.2f}".format(cand["end"]),
-        "-i", src,
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-c:a", "aac", "-movflags", "+faststart",
-        dst,
+def output_dims(ratio, height):
+    """Dimensi piksel keluaran, sama seperti yang dihasilkan
+    build_filter."""
+    height = int(height)
+    if ratio == "9:16":
+        w = height
+        h = int(w * 16 / 9)
+        return w, h - h % 2
+    if ratio == "1:1":
+        return height, height
+    return 1280, 720  # 16:9: perkiraan untuk PlayRes ASS
+
+
+def _ass_time(sec):
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return "{}:{:02d}:{:05.2f}".format(h, m, s)
+
+
+def build_clip_ass(segs, cand, settings, job_dir, idx):
+    """Buat berkas .ass caption viral per-kata untuk satu klip.
+
+    Kata-kata dari segmen transkrip yang tumpang tindih dengan jendela
+    klip dikelompokkan 3-4 kata per baris; tiap kata diberi tag karaoke
+    \\kf sehingga kata yang sedang diucapkan menyala (gaya klip viral).
+    Waktu per kata ditimbang dari panjang katanya di dalam segmen.
+    Mengembalikan path berkas, atau None bila tak ada teks.
+    """
+    words = []  # (start_rel, end_rel, text)
+    for s in segs:
+        if s["end"] <= cand["start"] or s["start"] >= cand["end"]:
+            continue
+        parts = [w for w in re.split(r"\s+", s["text"].strip()) if w]
+        parts = [w.replace("{", "(").replace("}", ")") for w in parts]
+        if not parts:
+            continue
+        total = sum(len(w) for w in parts) or 1
+        t = max(s["start"], cand["start"])
+        seg_end = min(s["end"], cand["end"])
+        span = max(0.1, seg_end - t)
+        for w in parts:
+            d = max(0.06, span * len(w) / total)
+            words.append((t - cand["start"], t - cand["start"] + d, w))
+            t += d
+    if not words:
+        return None
+
+    style_name = settings.get("captionStyle", "pop")
+    w_px, h_px = output_dims(settings["ratio"], settings["height"])
+    fsize = max(28, round(h_px * 0.047))
+    margin_v = round(h_px * 0.17)
+    if style_name == "klasik":
+        primary, secondary, border, back = (
+            "&H00FFFFFF", "&H00FFFFFF", 1, "&H00000000")
+        outline = 5
+    elif style_name == "kotak":
+        primary, secondary, border, back = (
+            "&H0000FFFF", "&H00FFFFFF", 3, "&H96000000")
+        outline = 12
+    else:  # pop
+        primary, secondary, border, back = (
+            "&H0000FFFF", "&H00FFFFFF", 1, "&H00000000")
+        outline = 5
+    upper = style_name in ("pop", "kotak")
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: {}".format(w_px),
+        "PlayResY: {}".format(h_px),
+        "",
+        "[V4+ Styles]",
+        ("Format: Name, Fontname, Fontsize, PrimaryColour, "
+         "SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
+         "MarginV, Encoding"),
+        ("Style: Viral,DejaVu Sans,{},{},{},&H00000000,{},1,0,0,0,100,"
+         "100,0,0,{},{},1,2,24,24,{},1").format(
+             fsize, primary, secondary, back, border, outline, margin_v),
+        "",
+        "[Events]",
+        ("Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+         "MarginV, Effect, Text"),
     ]
-    res = run_cmd(cmd, timeout=900)
-    if res.returncode == 0 and os.path.exists(dst):
-        return True
-    # bila gagal (mis. drawtext), coba lagi tanpa overlay teks
-    if settings.get("teaser"):
+    chunk = []
+    chunk_start = None
+
+    def flush():
+        if not chunk:
+            return
+        start = chunk[0][0]
+        end = chunk[-1][1] + 0.05
+        pieces = []
+        for ws, we, wt in chunk:
+            cs = max(1, round((we - ws) * 100))
+            txt = wt.upper() if upper else wt
+            pieces.append("{{\\kf{}}}{}".format(cs, txt))
+        lines.append("Dialogue: 0,{},{},Viral,,0,0,0,,{}".format(
+            _ass_time(start), _ass_time(end), " ".join(pieces)))
+
+    for item in words:
+        if chunk and (len(chunk) >= 4 or item[1] - chunk_start > 2.4):
+            flush()
+            chunk = []
+        if not chunk:
+            chunk_start = item[0]
+        chunk.append(item)
+    flush()
+
+    path = os.path.join(job_dir, "cap{}.ass".format(idx))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def _subtitles_filter(ass_path):
+    esc = (ass_path.replace("\\", "\\\\").replace(":", "\\:")
+           .replace("'", "\\'"))
+    return "subtitles='{}'".format(esc)
+
+
+def cut_clip(src, dst, cand, settings, ass_path=None):
+    """Potong satu segmen dengan ffmpeg. True bila sukses."""
+    teaser = cand.get("hook") if settings.get("teaser") else None
+    variants = []
+    vf = build_filter(settings["ratio"], settings["height"],
+                      teaser, settings.get("teaserSeconds", 3))
+    if ass_path:
+        vf += "," + _subtitles_filter(ass_path)
+    variants.append(vf)
+    if teaser:  # cadangan: tanpa teaser, caption tetap
         vf2 = build_filter(settings["ratio"], settings["height"], None, 0)
-        cmd2 = [
+        if ass_path:
+            vf2 += "," + _subtitles_filter(ass_path)
+        variants.append(vf2)
+    variants.append(build_filter(settings["ratio"], settings["height"],
+                                 None, 0))
+    for vf in variants:
+        cmd = [
             "ffmpeg", "-y",
             "-ss", "{:.2f}".format(cand["start"]),
             "-to", "{:.2f}".format(cand["end"]),
             "-i", src,
-            "-vf", vf2,
+            "-vf", vf,
             "-c:v", "libx264", "-preset", "veryfast",
             "-c:a", "aac", "-movflags", "+faststart",
             dst,
         ]
-        res2 = run_cmd(cmd2, timeout=900)
-        return res2.returncode == 0 and os.path.exists(dst)
+        res = run_cmd(cmd, timeout=900)
+        if res.returncode == 0 and os.path.exists(dst):
+            return True
     return False
 
 
@@ -741,13 +860,26 @@ def process_job(job, url, gemini_key, settings):
             raise RuntimeError("Tidak ada momen yang bisa dipotong.")
         set_progress(job, 60)
 
+        if settings.get("captions"):
+            if segs:
+                log(job, "Caption viral akan dibakar ke klip.")
+            else:
+                log(job, "Caption dilewati: transkrip tidak tersedia.")
+
         total = len(picked)
         for i, cand in enumerate(picked, start=1):
             cand["hook"] = hook_for_segment(segs, cand, title)
             log(job, "Memotong klip {}/{}…".format(i, total))
             fname = "clip{}.mp4".format(i)
             dst = os.path.join(job_dir, fname)
-            if not cut_clip(src, dst, cand, settings):
+            ass_path = None
+            if settings.get("captions") and segs:
+                try:
+                    ass_path = build_clip_ass(segs, cand, settings,
+                                              job_dir, i)
+                except Exception:
+                    ass_path = None
+            if not cut_clip(src, dst, cand, settings, ass_path=ass_path):
                 log(job, "Klip {} gagal dipotong, dilewati.".format(i))
                 continue
             job["clips"].append({
@@ -835,6 +967,9 @@ def create_job():
         "teaser": bool(s.get("teaser", True)),
         "teaserSeconds": max(1, min(10, int(s.get("teaserSeconds", 3)))),
         "onlyHighScore": bool(s.get("onlyHighScore", False)),
+        "captions": bool(s.get("captions", True)),
+        "captionStyle": s.get("captionStyle") if s.get("captionStyle") in
+                        ("pop", "klasik", "kotak") else "pop",
     }
     if settings["maxDur"] < settings["minDur"]:
         settings["maxDur"] = settings["minDur"]
