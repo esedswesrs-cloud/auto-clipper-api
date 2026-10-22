@@ -77,6 +77,42 @@ def run_cmd(cmd, timeout=600):
 
 
 # ---------------------------------------------------------------- yt-dlp
+def _cookies_to_netscape(content):
+    """YOUTUBE_COOKIES bisa berupa teks Netscape atau JSON (ekspor ekstensi).
+
+    yt-dlp hanya menerima format Netscape, jadi JSON dikonversi di sini.
+    """
+    text = content.strip()
+    if not text.startswith(("[", "{")):
+        return text
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text
+    if isinstance(data, dict):
+        data = data.get("cookies", [])
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        domain = str(c.get("domain", ""))
+        name = str(c.get("name", ""))
+        if not domain or not name:
+            continue
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(c.get("path", "/"))
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        exp = c.get("expirationDate", c.get("expiry", 0))
+        try:
+            exp = int(float(exp))
+        except Exception:
+            exp = 0
+        value = str(c.get("value", ""))
+        lines.append("\t".join([domain, flag, path, secure, str(exp),
+                                name, value]))
+    return "\n".join(lines) + "\n"
+
+
 def ytdlp_base_args(job_dir):
     """Argumen dasar yt-dlp, termasuk cookies dari env YOUTUBE_COOKIES."""
     args = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings"]
@@ -84,7 +120,7 @@ def ytdlp_base_args(job_dir):
     if cookies_content:
         cpath = os.path.join(job_dir, "cookies.txt")
         with open(cpath, "w", encoding="utf-8") as f:
-            f.write(cookies_content)
+            f.write(_cookies_to_netscape(cookies_content))
         args += ["--cookies", cpath]
     return args
 
