@@ -116,13 +116,15 @@ def _cookies_to_netscape(content):
     return "\n".join(lines) + "\n"
 
 
-def ytdlp_base_args(job_dir, use_cookies=True):
+def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False):
     """Argumen dasar yt-dlp.
 
-    - Proxy SOCKS5 (WARP via wireproxy, disiapkan start.sh): SEMUA
-      trafik yt-dlp keluar lewat IP Cloudflare WARP karena IP
-      datacenter Render diblokir YouTube. Kosongkan env CLIP_PROXY
-      untuk mematikan.
+    - Proxy SOCKS5 (WARP via wireproxy, disiapkan start.sh) hanya
+      dipakai bila use_proxy=True — dipakai untuk UNDUHAN saja:
+      tahap info justru lolos dari IP Render langsung, sementara
+      unduhan googlevideo diharapkan lolos lewat IP WARP (IPv4
+      dipaksa, mengikuti setup yang terbukti di laporan riset).
+      Kosongkan env CLIP_PROXY untuk mematikan.
     - JS runtime (Deno/Node) + remote component EJS: WAJIB sejak
       yt-dlp modern — tanpa runtime JS, tantangan n-challenge YouTube
       tak terselesaikan dan format video jadi kosong.
@@ -132,8 +134,8 @@ def ytdlp_base_args(job_dir, use_cookies=True):
             "--no-warnings",
             "--js-runtimes", "deno", "--js-runtimes", "node",
             "--remote-components", "ejs:github"]
-    if PROXY_URL:
-        args += ["--proxy", PROXY_URL]
+    if use_proxy and PROXY_URL:
+        args += ["--proxy", PROXY_URL, "--force-ipv4"]
     cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if use_cookies and cookies_content:
         cpath = os.path.join(job_dir, "cookies.txt")
@@ -180,7 +182,7 @@ def _is_retryable(text):
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False,
-              attempts=None):
+              attempts=None, use_proxy=False):
     """Jalankan yt-dlp melewati daftar percobaan (klien, pakai cookies).
 
     Error apa pun -> percobaan berikutnya. verbose=True menyaring
@@ -192,7 +194,8 @@ def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False,
         if use_cookies and not os.environ.get(
                 "YOUTUBE_COOKIES", "").strip():
             continue
-        args = ytdlp_base_args(job_dir, use_cookies=use_cookies)
+        args = ytdlp_base_args(job_dir, use_cookies=use_cookies,
+                               use_proxy=use_proxy)
         if verbose:
             args += ["--verbose"]
         if client:
@@ -429,7 +432,7 @@ def download_video(job, url, job_dir, info=None):
         "-o", out,
         url,
     ], timeout=1200, errlabel="yt-dlp gagal mengunduh video",
-        attempts=attempts)
+        attempts=attempts, use_proxy=True)
     for name in sorted(os.listdir(job_dir)):
         if name.startswith("source."):
             return os.path.join(job_dir, name)
