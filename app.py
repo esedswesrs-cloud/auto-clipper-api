@@ -30,6 +30,17 @@ GEMINI_URL = (
 
 app = Flask(__name__)
 
+
+@app.after_request
+def _cors(resp):
+    """Izin CORS untuk frontend (Cloudflare Pages) — tanpa header ini
+    browser memblokir semua jawaban backend ("Failed to fetch"),
+    walau backend-nya sendiri sehat."""
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
