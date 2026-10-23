@@ -2,6 +2,7 @@ flask>=3.0
 yt-dlp[default]
 requests>=2.31
 curl-cffi>=0.7
+yt-dlp-ytse>=0.4
 gunicorn>=21.2
 bgutil-ytdlp-pot-provider>=1.0
 PySocks>=1.7

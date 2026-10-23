@@ -1103,6 +1103,26 @@ def debug_probe():
     mode = data.get("mode") or "info"
     tmp = tempfile.mkdtemp(prefix="probe-")
     try:
+        if mode == "sabr":
+            args = ytdlp_base_args(tmp, use_cookies=True,
+                                   use_proxy=False)
+            dst = os.path.join(tmp, "sabr_out.mp4")
+            res = run_cmd(args + [
+                "--extractor-args", "youtube:formats=sabr",
+                "-f", "best[height<=720]/best",
+                "--download-sections", "*0-20",
+                "--force-keyframes-at-cuts",
+                "-o", dst, url,
+            ], timeout=240)
+            size = (os.path.getsize(dst)
+                    if os.path.exists(dst) else 0)
+            tail = (res.stderr or res.stdout or "").strip()
+            return jsonify({
+                "ok": res.returncode == 0 and size > 100000,
+                "stage": "sabr-download",
+                "bytes_written": size,
+                "tail": tail[-400:],
+            })
         args = ytdlp_base_args(tmp, use_cookies=use_cookies,
                                use_proxy=False)
         if client != "default":
