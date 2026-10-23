@@ -143,6 +143,7 @@ def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False):
     """
     args = [sys.executable, "-m", "yt_dlp", "--no-playlist",
             "--no-warnings",
+            "--impersonate", "chrome",
             "--js-runtimes", "deno", "--js-runtimes", "node",
             "--remote-components", "ejs:github"]
     if use_proxy and PROXY_URL:
@@ -352,8 +353,16 @@ def _http_download(job, fmt_entry, dest):
     headers.setdefault("User-Agent", "Mozilla/5.0")
     proxies = ({"http": PROXY_URL, "https": PROXY_URL}
                if PROXY_URL else None)
-    with requests.get(fmt_entry["url"], headers=headers, stream=True,
-                      timeout=60, proxies=proxies) as r:
+    try:
+        from curl_cffi import requests as _cffi_requests
+        def _get(**kw):
+            return _cffi_requests.get(fmt_entry["url"],
+                                      impersonate="chrome", **kw)
+    except Exception:
+        def _get(**kw):
+            return requests.get(fmt_entry["url"], **kw)
+    with _get(headers=headers, stream=True,
+              timeout=60, proxies=proxies) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
