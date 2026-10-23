@@ -170,6 +170,8 @@ ATTEMPTS = [
     ("visionos", False),
     ("web_safari", False),
     (None, True),
+    ("web_safari", True),
+    ("ios_downgraded", True),
     ("web_embedded", True),
     ("tv_downgraded", True),
     ("web_creator", True),
