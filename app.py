@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -1076,6 +1077,126 @@ def debug_egress():
         except Exception as e:
             out[label] = {"error": str(e)[:160]}
     return jsonify(out)
+
+
+@app.post("/api/debug/probe")
+def debug_probe():
+    """Probe bedah yt-dlp satu percobaan (tanpa tangga, tanpa job).
+
+    Header wajib: X-Probe-Key == env PROBE_KEY.
+    Body: {url, client, cookies: bool, mode: "info"|"bytes",
+           format_id?, proto?: "hls"|"https"}
+    - info: ekstrak -J sekali, rangkum format (total, maks, HLS).
+    - bytes: ekstrak lalu unduh <=1MB dari format terpilih memakai
+      curl_cffi impersonate; untuk HLS, ambil manifest + segmen
+      pertama. Melaporkan status HTTP saja.
+    """
+    key = os.environ.get("PROBE_KEY", "")
+    if not key or request.headers.get("X-Probe-Key") != key:
+        return jsonify({"error": "unauthorized"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url") or ""
+    if "youtube.com/watch" not in url and "youtu.be/" not in url:
+        return jsonify({"error": "url youtube tidak valid"}), 400
+    client = (data.get("client") or "web").strip()
+    use_cookies = bool(data.get("cookies", True))
+    mode = data.get("mode") or "info"
+    tmp = tempfile.mkdtemp(prefix="probe-")
+    try:
+        args = ytdlp_base_args(tmp, use_cookies=use_cookies,
+                               use_proxy=False)
+        if client != "default":
+            args += ["--extractor-args",
+                     "youtube:player_client=" + client]
+        res = run_cmd(args + ["-J", "--skip-download", url],
+                      timeout=120)
+        if res.returncode != 0:
+            tail = (res.stderr or res.stdout or "").strip()
+            return jsonify({"ok": False, "stage": "extract",
+                            "error": tail[-400:]})
+        info = json.loads(res.stdout)
+        fmts = info.get("formats") or []
+
+        def _h(f):
+            return f.get("height") or 0
+
+        hls = [{"format_id": f.get("format_id"), "height": _h(f),
+                "protocol": f.get("protocol")}
+               for f in fmts if "m3u8" in (f.get("protocol") or "")]
+        summary = {
+            "ok": True,
+            "title": (info.get("title") or "")[:100],
+            "n_formats": len(fmts),
+            "max_h": max((_h(f) for f in fmts), default=0),
+            "hls": sorted(hls, key=lambda x: x["height"],
+                          reverse=True)[:8],
+        }
+        if mode == "info":
+            return jsonify(summary)
+        # ---- mode bytes ----
+        fid = data.get("format_id")
+        proto = data.get("proto") or "https"
+        cand = None
+        for f in fmts:
+            if fid and f.get("format_id") == fid:
+                cand = f
+                break
+        if cand is None:
+            pool = [f for f in fmts if f.get("url")]
+            if proto == "hls":
+                pool = [f for f in pool
+                        if "m3u8" in (f.get("protocol") or "")]
+            else:
+                pool = [f for f in pool
+                        if "m3u8" not in (f.get("protocol") or "")]
+            pool = [f for f in pool if _h(f) <= 720] or pool
+            pool.sort(key=_h, reverse=True)
+            cand = pool[0] if pool else None
+        if cand is None:
+            return jsonify({**summary, "ok": False,
+                            "stage": "pick",
+                            "error": "tidak ada format cocok"})
+        out = {**summary, "picked": {
+            "format_id": cand.get("format_id"), "height": _h(cand),
+            "protocol": cand.get("protocol")}}
+        try:
+            from curl_cffi import requests as creq
+            getter = creq.get
+            kw = {"impersonate": "chrome"}
+        except Exception:
+            getter = requests.get
+            kw = {}
+        hdrs = dict(cand.get("http_headers") or {})
+        u = cand["url"]
+        if "m3u8" in (cand.get("protocol") or ""):
+            r = getter(u, headers=hdrs, timeout=30, **kw)
+            out["manifest_status"] = r.status_code
+            seg = None
+            for ln in (r.text or "").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    seg = ln
+                    break
+            if seg:
+                seg_url = (seg if seg.startswith("http")
+                           else u.rsplit("/", 1)[0] + "/" + seg)
+                r2 = getter(seg_url, headers=hdrs, timeout=30, **kw)
+                out["segment_status"] = r2.status_code
+                out["segment_bytes_head"] = len(r2.content[:1024])
+            out["ok"] = (out.get("manifest_status") == 200
+                         and out.get("segment_status") == 200)
+            return jsonify(out)
+        hdrs["Range"] = "bytes=0-1048575"
+        r = getter(u, headers=hdrs, timeout=30, **kw)
+        out["byte_status"] = r.status_code
+        out["bytes_head"] = len(r.content[:1024])
+        out["ok"] = r.status_code in (200, 206)
+        return jsonify(out)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "stage": "exception",
+                        "error": str(e)[:300]})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.post("/api/job")
