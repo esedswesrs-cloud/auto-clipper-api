@@ -330,7 +330,7 @@ def fetch_transcript(job, info, job_dir):
         return []
 
 
-def _http_download(job, fmt_entry, dest):
+def _http_download(job, fmt_entry, dest, use_proxy=True):
     """Unduh satu format langsung dari URL hasil ekstraksi info.
 
     Format HLS (m3u8, khas klien TV/embedded) diambil pakai ffmpeg
@@ -352,7 +352,7 @@ def _http_download(job, fmt_entry, dest):
     headers = dict(fmt_entry.get("http_headers") or {})
     headers.setdefault("User-Agent", "Mozilla/5.0")
     proxies = ({"http": PROXY_URL, "https": PROXY_URL}
-               if PROXY_URL else None)
+               if (use_proxy and PROXY_URL) else None)
     try:
         from curl_cffi import requests as _cffi_requests
         def _get(**kw):
@@ -361,13 +361,19 @@ def _http_download(job, fmt_entry, dest):
     except Exception:
         def _get(**kw):
             return requests.get(fmt_entry["url"], **kw)
-    with _get(headers=headers, stream=True,
-              timeout=60, proxies=proxies) as r:
+    r = _get(headers=headers, stream=True,
+             timeout=60, proxies=proxies)
+    try:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
     return dest
 
 
@@ -388,6 +394,14 @@ def _download_from_info(job, info, job_dir):
     def h(f):
         return f.get("height") or 0
 
+    def _dl(entry, dest):
+        # Sesi-konsisten dulu: URL dari info diekstrak langsung dari IP
+        # ini, jadi unduhan langsung didahulukan; WARP jadi cadangan.
+        try:
+            return _http_download(job, entry, dest, use_proxy=False)
+        except Exception:
+            return _http_download(job, entry, dest, use_proxy=True)
+
     muxed = [f for f in formats
              if f.get("vcodec") not in (None, "none")
              and f.get("acodec") not in (None, "none")
@@ -407,7 +421,7 @@ def _download_from_info(job, info, job_dir):
         log(job, "Unduh langsung format {} ({}p, {}).".format(
             f.get("format_id"), h(f), f.get("protocol")))
         dest = os.path.join(job_dir, "source.mp4")
-        _http_download(job, f, dest)
+        _dl(f, dest)
         return dest
     if videos and audios:
         v, a = videos[0], audios[0]
@@ -416,8 +430,8 @@ def _download_from_info(job, info, job_dir):
                     a.get("format_id")))
         vpath = os.path.join(job_dir, "source_v.bin")
         apath = os.path.join(job_dir, "source_a.bin")
-        _http_download(job, v, vpath)
-        _http_download(job, a, apath)
+        _dl(v, vpath)
+        _dl(a, apath)
         dest = os.path.join(job_dir, "source.mp4")
         res = run_cmd(["ffmpeg", "-y", "-i", vpath, "-i", apath,
                        "-c", "copy", dest], timeout=600)
@@ -446,15 +460,25 @@ def download_video(job, url, job_dir, info=None):
         "best[height<=720][ext=mp4]/best[height<=720]/"
         "bestvideo[height<=720]+bestaudio/best"
     )
-    run_ytdlp(job, job_dir, [
+    tail = [
         "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", out,
         url,
-    ], timeout=1200, errlabel="yt-dlp gagal mengunduh video",
-        attempts=attempts, use_proxy=True)
+    ]
+    # Langsung (sesi-konsisten + impersonate) didahulukan; WARP cadangan.
+    try:
+        run_ytdlp(job, job_dir, tail, timeout=1200,
+                  errlabel="yt-dlp gagal mengunduh video (langsung)",
+                  attempts=attempts, use_proxy=False)
+    except RuntimeError:
+        log(job, "Jalur langsung gagal total, coba lewat WARP…")
+        run_ytdlp(job, job_dir, tail, timeout=1200,
+                  errlabel="yt-dlp gagal mengunduh video",
+                  attempts=attempts, use_proxy=True)
     for name in sorted(os.listdir(job_dir)):
-        if name.startswith("source."):
+        if name.startswith("source.") and ".part" not in name \
+                and not name.endswith(".ytdl"):
             return os.path.join(job_dir, name)
     raise RuntimeError("Berkas video hasil unduhan tidak ditemukan.")
 
