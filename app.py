@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import glob
 import subprocess
 import sys
 import tempfile
@@ -1269,6 +1270,170 @@ def debug_probe():
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "stage": "exception",
                         "error": str(e)[:300]})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------- jembatan downloader
+# Unduh YouTube PENUH untuk web Downloader: resep yang terbukti di box
+# InstaBox (web_safari + cookies, HLS) dengan tangga kualitas otomatis
+# (diminta -> 720 -> 480 -> 360). Di Render endpoint ini ikut terpasang
+# tapi akan gagal oleh gerbang IP di sana; rumahnya memang di box.
+YTDL_JOBS = {}
+YTDL_LOCK = threading.Lock()
+YTDL_DIR = "/tmp/ytdljobs"
+
+
+def _ytdl_worker(job):
+    jid = job["id"]
+    jdir = os.path.join(YTDL_DIR, jid)
+    os.makedirs(jdir, exist_ok=True)
+    url = job["url"]
+    try:
+        base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=False)
+        client = ["--extractor-args",
+                  "youtube:player_client=web_safari"]
+        res = run_cmd(base + client + ["-J", "--skip-download", url],
+                      timeout=120)
+        if res.returncode == 0:
+            try:
+                info = json.loads(res.stdout)
+                job["title"] = (info.get("title") or "")[:120]
+                job["duration"] = info.get("duration") or 0
+            except Exception:
+                pass
+        if job["mode"] == "audio":
+            ladder = [(0, "bestaudio/best")]
+        else:
+            heights = []
+            for h in (job["quality"], 720, 480, 360):
+                if h and h <= job["quality"] and h not in heights:
+                    heights.append(h)
+            ladder = [(h, "best[height<={}]/best".format(h))
+                      for h in heights]
+        last_err = ""
+        for h, fsel in ladder:
+            args = base + client + [
+                "-f", fsel, "-o", os.path.join(jdir, "media.%(ext)s")]
+            if job["mode"] == "audio":
+                args += ["-x", "--audio-format", "mp3"]
+            args += [url]
+            res = run_cmd(args, timeout=1800)
+            files = [f for f in glob.glob(os.path.join(jdir, "media.*"))
+                     if ".part" not in f]
+            if res.returncode == 0 and files:
+                job["file"] = os.path.basename(files[0])
+                if job["mode"] == "video":
+                    pr = run_cmd(
+                        ["ffprobe", "-v", "error", "-select_streams",
+                         "v:0", "-show_entries", "stream=height",
+                         "-of", "csv=p=0", files[0]], timeout=30)
+                    try:
+                        job["height"] = int(
+                            (pr.stdout or "0").strip() or 0)
+                    except Exception:
+                        job["height"] = h or 0
+                job["status"] = "done"
+                return
+            last_err = (res.stderr or "")[-300:]
+        raise RuntimeError("semua tangga kualitas gagal: " + last_err)
+    except Exception as e:  # noqa: BLE001
+        job["status"] = "error"
+        job["error"] = str(e)[:300]
+
+
+@app.post("/api/ytdl")
+def ytdl_create():
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if ("youtube.com/watch" not in url and "youtu.be/" not in url
+            and "youtube.com/shorts/" not in url):
+        return jsonify({"error": "url youtube tidak valid"}), 400
+    try:
+        q = int(data.get("quality") or 720)
+    except Exception:
+        q = 720
+    jid = uuid.uuid4().hex[:12]
+    job = {"id": jid, "url": url, "quality": q,
+           "mode": "audio" if data.get("mode") == "audio" else "video",
+           "status": "running", "title": "", "duration": 0,
+           "height": 0, "file": None, "error": None}
+    with YTDL_LOCK:
+        YTDL_JOBS[jid] = job
+    threading.Thread(target=_ytdl_worker, args=(job,),
+                     daemon=True).start()
+    return jsonify({"id": jid, "status": "running"})
+
+
+@app.get("/api/ytdl/<jid>")
+def ytdl_status(jid):
+    with YTDL_LOCK:
+        job = YTDL_JOBS.get(jid)
+    if not job:
+        return jsonify({"error": "tidak ditemukan"}), 404
+    out = {k: job[k] for k in ("id", "status", "title", "duration",
+                               "height", "mode", "error")}
+    if job["status"] == "done":
+        out["file_url"] = "/api/ytdl/file/" + jid
+    return jsonify(out)
+
+
+@app.get("/api/ytdl/file/<jid>")
+def ytdl_file(jid):
+    with YTDL_LOCK:
+        job = YTDL_JOBS.get(jid)
+    if not job or job["status"] != "done" or not job.get("file"):
+        return jsonify({"error": "belum siap"}), 404
+    fname = job["file"]
+    ext = os.path.splitext(fname)[1]
+    title = re.sub(r"[^\w\-. ]+", "", job["title"] or "youtube")
+    title = title.strip()[:80] or "youtube"
+    if job["mode"] == "audio":
+        dl = title + " - audio.mp3"
+    else:
+        dl = title + " - {}p{}".format(job["height"] or job["quality"],
+                                        ext)
+    return send_from_directory(os.path.join(YTDL_DIR, jid), fname,
+                               as_attachment=True, download_name=dl)
+
+
+# ------------------------------------------------------------- cek gerbang
+# Tes byte RINGAN untuk pemantau berkala: unduh 5 detik pertama video
+# pendek tetap via resep web_safari+cookies. Hasil di-cache 10 menit
+# agar endpoint publik ini tidak bisa dipakai menguras kuota.
+GATECHECK = {"at": 0, "ok": None, "detail": ""}
+GATECHECK_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+
+@app.get("/api/gatecheck")
+def gatecheck():
+    now = time.time()
+    if GATECHECK["ok"] is not None and now - GATECHECK["at"] < 600:
+        return jsonify({"ok": GATECHECK["ok"], "cached": True,
+                        "detail": GATECHECK["detail"]})
+    tmp = tempfile.mkdtemp(prefix="gate-")
+    try:
+        base = ytdlp_base_args(tmp, use_cookies=True, use_proxy=False)
+        args = base + [
+            "--extractor-args", "youtube:player_client=web_safari",
+            "-f", "best[height<=360]/best",
+            "--download-sections", "*0-5",
+            "--force-keyframes-at-cuts",
+            "-o", os.path.join(tmp, "g.mp4"), GATECHECK_URL]
+        res = run_cmd(args, timeout=120)
+        size = 0
+        p = os.path.join(tmp, "g.mp4")
+        if os.path.exists(p):
+            size = os.path.getsize(p)
+        ok = res.returncode == 0 and size > 50000
+        tail = (res.stderr or "").strip()[-160:]
+        GATECHECK.update({"at": now, "ok": ok,
+                          "detail": "bytes={} {}".format(size, tail)})
+        return jsonify({"ok": ok, "cached": False,
+                        "detail": GATECHECK["detail"]})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "cached": False,
+                        "detail": str(e)[:160]})
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
