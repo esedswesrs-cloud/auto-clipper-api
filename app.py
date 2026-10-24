@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.6"
+APP_VER = "1.7"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -145,6 +145,33 @@ def is_meta_url(url):
     return any(host == h or host.endswith("." + h) for h in META_HOSTS)
 
 
+# TikTok: video publik kebaca langsung tanpa login (terbukti 24 Okt 2026:
+# yt-dlp -J polos lolos, 172 dtk 720x1280) — tanpa cookies, tanpa proxy.
+TIKTOK_HOSTS = ("tiktok.com",)
+
+
+def is_tiktok_url(url):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in TIKTOK_HOSTS)
+
+
+def cookies_file_for(url):
+    """File cookies per platform Meta: Instagram pakai file sendiri
+    (env IG_COOKIES_FILE), Facebook/fb.watch pakai FB_COOKIES_FILE.
+    Mengembalikan (path, nama_platform)."""
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        host = ""
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return (os.environ.get("IG_COOKIES_FILE", "").strip(),
+                "Instagram")
+    return os.environ.get("FB_COOKIES_FILE", "").strip(), "Facebook"
+
+
 def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False,
                     cookies_path=None):
     """Argumen dasar yt-dlp.
@@ -203,8 +230,14 @@ ATTEMPTS = [
 
 # Jalur Meta (Facebook/Instagram): satu percobaan langsung, tanpa
 # extractor-args YouTube dan tanpa proxy — resep jembatan yang terbukti
-# (cookies dari file server FB_COOKIES_FILE).
+# (cookies dari file server: FB_COOKIES_FILE untuk Facebook,
+# IG_COOKIES_FILE untuk Instagram).
 META_ATTEMPTS = [(None, False)]
+
+
+# Jalur TikTok: satu percobaan langsung, tanpa cookies, tanpa proxy,
+# tanpa extractor-args YouTube (terbukti lolos polos 24 Okt 2026).
+TIKTOK_ATTEMPTS = [(None, False)]
 
 
 def _is_bot_error(text):
@@ -223,25 +256,29 @@ def _is_retryable(text):
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False,
-              attempts=None, use_proxy=False, meta=False):
+              attempts=None, use_proxy=False, meta=False, tiktok=False):
     """Jalankan yt-dlp melewati daftar percobaan (klien, pakai cookies).
 
     Error apa pun -> percobaan berikutnya. verbose=True menyaring
     baris terkait PO Token dari stderr ke log (diagnosis bgutil).
     Percobaan yang menang dicatat di job["win_attempt"].
     meta=True: jalur Meta (Facebook/Instagram) — satu percobaan
-    langsung dengan cookies Facebook dari file server, tanpa
+    langsung dengan cookies dari file server per platform, tanpa
     extractor-args YouTube dan tanpa proxy.
+    tiktok=True: jalur TikTok — satu percobaan langsung, tanpa
+    cookies, tanpa extractor-args YouTube, tanpa proxy.
     """
     last_tail = "kesalahan tidak diketahui"
     cookies_path = None
     if meta:
-        fb = os.environ.get("FB_COOKIES_FILE", "").strip()
-        if not fb or not os.path.exists(fb):
+        url = tail_args[-1] if tail_args else ""
+        cookies_path, platform = cookies_file_for(url)
+        if not cookies_path or not os.path.exists(cookies_path):
             raise RuntimeError(
-                "cookies Facebook belum terpasang di server")
+                "cookies {} belum terpasang di server".format(platform))
         attempts = META_ATTEMPTS
-        cookies_path = fb
+    if tiktok:
+        attempts = TIKTOK_ATTEMPTS
     for client, use_cookies in (attempts or ATTEMPTS):
         if use_cookies and not os.environ.get(
                 "YOUTUBE_COOKIES", "").strip():
@@ -287,7 +324,8 @@ def fetch_info(job, url, job_dir):
     """Ambil metadata video (judul, durasi, heatmap) tanpa mengunduh."""
     res = run_ytdlp(job, job_dir, ["-J", url], timeout=180,
                     errlabel="yt-dlp gagal mengambil info video",
-                    verbose=True, meta=is_meta_url(url))
+                    verbose=True, meta=is_meta_url(url),
+                    tiktok=is_tiktok_url(url))
     info = json.loads(res.stdout)
     return info
 
@@ -495,6 +533,7 @@ def _download_from_info(job, info, job_dir):
 
 def download_video(job, url, job_dir, info=None):
     meta = is_meta_url(url)
+    tiktok = is_tiktok_url(url)
     # Cara utama: unduh langsung dari URL info yang sukses.
     if info:
         try:
@@ -519,13 +558,14 @@ def download_video(job, url, job_dir, info=None):
         url,
     ]
     # Langsung (sesi-konsisten + impersonate) didahulukan; WARP cadangan
-    # (bukan untuk Meta: resep jembatan terbukti lolos direct).
+    # (bukan untuk Meta/TikTok: resep direct terbukti lolos).
     try:
         run_ytdlp(job, job_dir, tail, timeout=1200,
                   errlabel="yt-dlp gagal mengunduh video (langsung)",
-                  attempts=attempts, use_proxy=False, meta=meta)
+                  attempts=attempts, use_proxy=False, meta=meta,
+                  tiktok=tiktok)
     except RuntimeError:
-        if meta:
+        if meta or tiktok:
             raise
         log(job, "Jalur langsung gagal total, coba lewat WARP…")
         run_ytdlp(job, job_dir, tail, timeout=1200,
@@ -1815,13 +1855,16 @@ def _ytdl_worker(job):
         meta = is_meta_url(url)
         if meta:
             # Meta: tanpa extractor-args YouTube, tanpa proxy (tes
-            # terbukti lolos direct), cookies dari file server.
-            fb = os.environ.get("FB_COOKIES_FILE", "").strip()
-            if not fb or not os.path.exists(fb):
+            # terbukti lolos direct), cookies dari file server
+            # per platform (FB_COOKIES_FILE / IG_COOKIES_FILE).
+            cookie_file, platform = cookies_file_for(url)
+            if not cookie_file or not os.path.exists(cookie_file):
                 raise RuntimeError(
-                    "cookies Facebook belum terpasang di server")
+                    "cookies {} belum terpasang di server".format(
+                        platform))
             base = ytdlp_base_args(jdir, use_cookies=False,
-                                   use_proxy=False, cookies_path=fb)
+                                   use_proxy=False,
+                                   cookies_path=cookie_file)
             client = []
         else:
             base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=True)
