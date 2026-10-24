@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.2"
+APP_VER = "1.5"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -315,14 +315,24 @@ def parse_json3(text):
     return segs
 
 
-def fetch_transcript(job, info, job_dir):
-    """Unduh subtitle (id diutamakan, lalu en) -> segmen ber-timestamp."""
+LANGS = ("auto", "id", "en", "ms", "ar", "zh", "hi", "ja", "ko",
+         "th", "vi", "tl", "pt", "es", "fr", "de", "it")
+
+
+def fetch_transcript(job, info, job_dir, lang_pref="auto"):
+    """Unduh subtitle -> segmen ber-timestamp.
+
+    Urutan bahasa: pilihan user dulu (bila bukan auto), lalu id, en."""
     subs = {}
     for key in ("subtitles", "automatic_captions"):
         for lang, tracks in (info.get(key) or {}).items():
             subs.setdefault(lang, tracks)
+    wants = []
+    if lang_pref and lang_pref != "auto":
+        wants.append(lang_pref)
+    wants += ["id", "en"]
     chosen = None
-    for want in ("id", "en"):
+    for want in wants:
         for lang, tracks in subs.items():
             if lang == want or lang.startswith(want + "-"):
                 chosen = tracks
@@ -570,9 +580,12 @@ def gemini_candidates(api_key, title, duration, segs, heat_info,
         "Transkrip ber-timestamp (detik):\n{tr}\n\n"
         "Balas HANYA JSON murni berupa array objek tanpa teks lain, format:\n"
         '[{{"start": 12, "end": 40, "hook": "kalimat pancingan pendek", '
-        '"score": 95}}]\n'
+        '"score": 95, "title": "Judul pendek clickbait", '
+        '"desc": "Teaser satu kalimat untuk caption postingan"}}]\n'
         "hook = kalimat pancingan pendek Bahasa Indonesia yang membuat "
-        "penasaran. score = 0-100."
+        "penasaran. score = 0-100. title = judul pendek gaya clickbait "
+        "untuk dibakar ke video. desc = teaser satu kalimat untuk "
+        "caption saat posting klip."
     ).format(
         title=title, dur=int(duration), aud=audience or "umum",
         n=count, mn=min_dur, mx=max_dur,
@@ -609,6 +622,8 @@ def gemini_candidates(api_key, title, duration, segs, heat_info,
                 "end": min(duration, e),
                 "hook": str(item.get("hook", "")).strip(),
                 "score": int(item.get("score", 50)),
+                "title": str(item.get("title", "")).strip(),
+                "desc": str(item.get("desc", "")).strip(),
             })
         return out
     except Exception:
@@ -641,7 +656,8 @@ def hook_for_segment(segs, cand, title):
 
 
 # ---------------------------------------------------------------- STT
-def groq_transcribe(job, src, job_dir, groq_key, total_duration):
+def groq_transcribe(job, src, job_dir, groq_key, total_duration,
+                     lang="auto"):
     """Transkrip audio pakai Groq Whisper (dipakai bila video tak
     punya transkrip YouTube dan caption aktif).
 
@@ -672,7 +688,9 @@ def groq_transcribe(job, src, job_dir, groq_key, total_duration):
                     files={"file": ("audio.mp3", fh, "audio/mpeg")},
                     data={"model": "whisper-large-v3-turbo",
                           "response_format": "verbose_json",
-                          "timestamp_granularities[]": ["word", "segment"]},
+                          "timestamp_granularities[]": ["word", "segment"],
+                          **({"language": lang} if lang and lang != "auto"
+                             else {})},
                     timeout=600,
                 )
         finally:
@@ -716,21 +734,157 @@ def sanitize_drawtext(text):
     return re.sub(r"\s+", " ", text).strip()[:90]
 
 
-def build_filter(ratio, height, teaser_text, teaser_seconds):
-    """Susun -vf untuk crop rasio + skala + overlay teaser opsional."""
+def _ass_color(hexstr):
+    """Hex RRGGBB -> warna ASS &H00BBGGRR; None bila tak valid."""
+    try:
+        h = (hexstr or "").strip().lstrip("#")
+        if len(h) != 6:
+            return None
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return "&H00{:02X}{:02X}{:02X}".format(b, g, r)
+    except Exception:
+        return None
+
+
+def probe_dims(src):
+    """Dimensi video sumber (lebar, tinggi) via ffprobe; (None, None)
+    bila gagal."""
+    try:
+        r = run_cmd(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-of", "csv=p=0", src], timeout=60)
+        out = (r.stdout or "").strip().split(",")
+        return int(out[0]), int(out[1])
+    except Exception:
+        return None, None
+
+
+def face_trajectory(src, start, end, job_dir, idx):
+    """Jejak posisi wajah untuk Smart Face Tracking.
+
+    Sampel 1 fps dari segmen klip, deteksi wajah terbesar (Haar),
+    kosong diisi tetangga terdekat, lalu smoothing rata-gerak.
+    Mengembalikan list (t_rel_detik, x_fraksi_lebar) atau None bila
+    OpenCV tak tersedia / tak ada wajah terdeteksi."""
+    try:
+        import cv2
+    except Exception:
+        return None
+    tmp = os.path.join(job_dir, "face{}".format(idx))
+    try:
+        os.makedirs(tmp, exist_ok=True)
+        dur = max(1.0, end - start)
+        cmd = ["ffmpeg", "-y", "-ss", "{:.2f}".format(start),
+               "-t", "{:.2f}".format(dur), "-i", src,
+               "-vf", "fps=1,scale=640:-2",
+               os.path.join(tmp, "f%03d.jpg")]
+        res = run_cmd(cmd, timeout=300)
+        if res.returncode != 0:
+            return None
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if cascade.empty():
+            return None
+        pts = []
+        for fn in sorted(os.listdir(tmp)):
+            if not fn.endswith(".jpg"):
+                continue
+            try:
+                n = int(fn[1:4])
+            except Exception:
+                continue
+            img = cv2.imread(os.path.join(tmp, fn))
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(gray, 1.2, 5,
+                                             minSize=(60, 60))
+            if len(faces) == 0:
+                pts.append((float(n - 1), None))
+                continue
+            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+            pts.append((float(n - 1), (x + w / 2.0) / img.shape[1]))
+        vals = [p[1] for p in pts]
+        last = None
+        for i, v in enumerate(vals):
+            if v is None:
+                vals[i] = last
+            else:
+                last = v
+        if all(v is None for v in vals):
+            return None
+        first = next(v for v in vals if v is not None)
+        vals = [first if v is None else v for v in vals]
+        sm = []
+        for i in range(len(vals)):
+            lo = max(0, i - 2)
+            hi = min(len(vals), i + 3)
+            sm.append(sum(vals[lo:hi]) / (hi - lo))
+        return [(t, v) for (t, _), v in zip(pts, sm)]
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _crop_px(x_frac, crop_w_expr):
+    """Ekspresi piksel x crop dari fraksi lebar, dijepit ke dalam
+    frame: x = x_frac*iw - crop_w/2, 0 <= x <= iw-crop_w."""
+    return "min(max({:.4f}*iw-({})/2,0),iw-({}))".format(
+        x_frac, crop_w_expr, crop_w_expr)
+
+
+def _x_expr_from_points(points, crop_w_expr):
+    """Ekspresi x crop bertingkat (step per detik) dari jejak wajah
+    [(t, x_frac)]. Titik berlaku untuk [t, t+1)."""
+    expr = None
+    for t, xf in reversed(points):
+        px = _crop_px(xf, crop_w_expr)
+        if expr is None:
+            expr = px
+        else:
+            expr = "if(lt(t,{:.2f}),{}, {})".format(t + 1.0, px, expr)
+    return expr
+
+
+def _x_expr_lerp(points, crop_w_expr):
+    """Ekspresi x crop interpolasi linear dari keyframe [(t, x_frac)].
+    Di luar rentang: nilai ujung terdekat."""
+    def px(xf):
+        return _crop_px(xf, crop_w_expr)
+    expr = px(points[-1][1])
+    for i in range(len(points) - 2, -1, -1):
+        t0, x0 = points[i]
+        t1, x1 = points[i + 1]
+        if t1 <= t0:
+            continue
+        lerp = ("({:.4f}+({:.4f}-{:.4f})*(t-{:.2f})/{:.2f})*iw"
+                "-({})/2".format(x0, x1, x0, t0, t1 - t0, crop_w_expr))
+        lerp = "min(max({},0),iw-({}))".format(lerp, crop_w_expr)
+        expr = "if(lt(t,{:.2f}),{}, {})".format(t1, lerp, expr)
+    expr = "if(lt(t,{:.2f}),{}, {})".format(points[0][0],
+                                            px(points[0][1]), expr)
+    return expr
+
+
+def _overlay_filters(settings, teaser_text, teaser_seconds, title_text):
+    """Filter drawtext untuk judul, teaser, dan watermark teks."""
     parts = []
-    if ratio == "9:16":
-        parts.append("crop=ih*9/16:ih")
-        # "height" = lebar target untuk video vertikal: 720 -> 720x1280
-        w = int(height)
-        h = int(w * 16 / 9)
-        h -= h % 2
-        parts.append("scale={}:{}".format(w, h))
-    elif ratio == "1:1":
-        parts.append("crop=ih:ih")
-        parts.append("scale={}:{}".format(height, height))
-    else:  # 16:9 tanpa crop, skala berdasarkan tinggi
-        parts.append("scale=-2:{}".format(height))
+    if title_text and settings.get("titleMode", "off") != "off":
+        safe = sanitize_drawtext(title_text)
+        if safe:
+            en = ":enable='lt(t,3)'" if settings["titleMode"] == "awal" \
+                else ""
+            if settings.get("titleStyle") == "teks":
+                parts.append(
+                    "drawtext=font='DejaVu Sans':text='{}':fontsize=44:"
+                    "fontcolor=white:borderw=2:bordercolor=black:"
+                    "x=(w-text_w)/2:y=40{}".format(safe, en))
+            else:  # bar: teks di atas bilah hitam transparan
+                parts.append(
+                    "drawtext=font='DejaVu Sans':text='{}':fontsize=40:"
+                    "fontcolor=white:box=1:boxcolor=black@0.6:"
+                    "boxborderw=24:x=(w-text_w)/2:y=30{}".format(safe, en))
     if teaser_text:
         safe = sanitize_drawtext(teaser_text)
         if safe:
@@ -741,6 +895,95 @@ def build_filter(ratio, height, teaser_text, teaser_seconds):
                     safe, float(teaser_seconds)
                 )
             )
+    wm = (settings.get("watermarkText") or "").strip()
+    if wm:
+        safe = sanitize_drawtext(wm)[:40]
+        if safe:
+            xy = {
+                "kanan-bawah": "x=w-text_w-20:y=h-text_h-20",
+                "kiri-bawah": "x=20:y=h-text_h-20",
+                "kanan-atas": "x=w-text_w-20:y=20",
+                "kiri-atas": "x=20:y=20",
+            }.get(settings.get("watermarkPos", "kanan-bawah"),
+                  "x=w-text_w-20:y=h-text_h-20")
+            op = max(10, min(100,
+                             int(settings.get("watermarkOpacity", 60)))) / 100.0
+            fs = max(16, min(64, int(settings.get("watermarkSize", 28))))
+            parts.append(
+                "drawtext=font='DejaVu Sans':text='{}':fontsize={}:"
+                "fontcolor=white@{:.2f}:borderw=1:bordercolor=black@0.5:"
+                "{}".format(safe, fs, op, xy))
+    return parts
+
+
+def _box_pct(d):
+    """Validasi kotak persen {x,y,w,h}; None bila tak valid."""
+    try:
+        x, y, w, h = (float(d["x"]), float(d["y"]),
+                      float(d["w"]), float(d["h"]))
+    except Exception:
+        return None
+    if not (0 <= x < 100 and 0 <= y < 100 and 0 < w <= 100
+            and 0 < h <= 100):
+        return None
+    if x + w > 100 or y + h > 100:
+        return None
+    return (x, y, w, h)
+
+
+def build_filter(settings, teaser_text=None, teaser_seconds=3,
+                 title_text=None, x_expr=None, crop_box=None):
+    """Susun -vf untuk crop rasio + skala + overlay.
+
+    settings: dict settings job. crop_box: (x%, y%, w%, h%) persen
+    dimensi sumber (crop manual, ganti crop tengah). x_expr:
+    ekspresi x crop (face tracking / keyframe, dikutip agar koma di
+    dalamnya tak memecah filter). Judul + watermark teks ikut di sini;
+    watermark gambar & gaming split memakai filter_complex di cut_clip.
+    """
+    ratio = settings["ratio"]
+    height = int(settings["height"])
+    parts = []
+    if ratio == "9:16-blur":
+        # latar blur: satu cabang diburamkan memenuhi frame, satu cabang
+        # video utuh di tengah (fit tinggi)
+        w = height
+        h = int(w * 16 / 9)
+        h -= h % 2
+        parts.append(
+            "split[a][b];[a]scale={0}:{1}:force_original_aspect_ratio"
+            "=increase,crop={0}:{1},gblur=sigma=20[bg];[b]scale=-2:{1}"
+            "[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2".format(w, h))
+    elif ratio == "9:16":
+        if crop_box:
+            xp, yp, wp, hp = crop_box
+            parts.append("crop=iw*{:.4f}:ih*{:.4f}:iw*{:.4f}:ih*{:.4f}"
+                         .format(wp / 100.0, hp / 100.0,
+                                 xp / 100.0, yp / 100.0))
+        elif x_expr:
+            parts.append("crop=ih*9/16:ih:'{}'".format(x_expr))
+        else:
+            parts.append("crop=ih*9/16:ih")
+        # "height" = lebar target untuk video vertikal: 720 -> 720x1280
+        w = height
+        h = int(w * 16 / 9)
+        h -= h % 2
+        parts.append("scale={}:{}".format(w, h))
+    elif ratio == "1:1":
+        if crop_box:
+            xp, yp, wp, hp = crop_box
+            parts.append("crop=iw*{:.4f}:ih*{:.4f}:iw*{:.4f}:ih*{:.4f}"
+                         .format(wp / 100.0, hp / 100.0,
+                                 xp / 100.0, yp / 100.0))
+        elif x_expr:
+            parts.append("crop=ih:ih:'{}'".format(x_expr))
+        else:
+            parts.append("crop=ih:ih")
+        parts.append("scale={}:{}".format(height, height))
+    else:  # 16:9 tanpa crop, skala berdasarkan tinggi
+        parts.append("scale=-2:{}".format(height))
+    parts.extend(_overlay_filters(settings, teaser_text, teaser_seconds,
+                                  title_text))
     return ",".join(parts)
 
 
@@ -748,7 +991,7 @@ def output_dims(ratio, height):
     """Dimensi piksel keluaran, sama seperti yang dihasilkan
     build_filter."""
     height = int(height)
-    if ratio == "9:16":
+    if ratio in ("9:16", "9:16-blur"):
         w = height
         h = int(w * 16 / 9)
         return w, h - h % 2
@@ -820,6 +1063,19 @@ def build_clip_ass(segs, cand, settings, job_dir, idx, words=None):
             "&H0000FFFF", "&H00FFFFFF", 1, "&H00000000")
         outline = 5
     upper = style_name in ("pop", "kotak")
+    # --- editor caption (v1.5): warna, ukuran, posisi, glow, kotak ---
+    size_pct = max(70, min(150, int(settings.get("capSizePct", 100))))
+    fsize = max(24, round(fsize * size_pct / 100.0))
+    pos_frac = {"bawah": 0.17, "tengah": 0.45, "atas": 0.78}.get(
+        settings.get("capPos", "bawah"), 0.17)
+    margin_v = round(h_px * pos_frac)
+    custom = _ass_color(settings.get("capColor", ""))
+    if custom:
+        primary = custom
+    if settings.get("capBox"):
+        border, back = 3, "&H96000000"
+    shadow = 2 if settings.get("capGlow") else 1
+    cap_chunk = max(1, min(8, int(settings.get("capChunk", 4))))
 
     lines = [
         "[Script Info]",
@@ -834,8 +1090,9 @@ def build_clip_ass(segs, cand, settings, job_dir, idx, words=None):
          "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
          "MarginV, Encoding"),
         ("Style: Viral,DejaVu Sans,{},{},{},&H00000000,{},1,0,0,0,100,"
-         "100,0,0,{},{},1,2,24,24,{},1").format(
-             fsize, primary, secondary, back, border, outline, margin_v),
+         "100,0,0,{},{},{},2,24,24,{},1").format(
+             fsize, primary, secondary, back, border, outline, shadow,
+             margin_v),
         "",
         "[Events]",
         ("Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
@@ -858,7 +1115,8 @@ def build_clip_ass(segs, cand, settings, job_dir, idx, words=None):
             _ass_time(start), _ass_time(end), " ".join(pieces)))
 
     for item in clip_words:
-        if chunk and (len(chunk) >= 4 or item[1] - chunk_start > 2.4):
+        if chunk and (len(chunk) >= cap_chunk
+                      or item[1] - chunk_start > 2.4):
             flush()
             chunk = []
         if not chunk:
@@ -878,33 +1136,151 @@ def _subtitles_filter(ass_path):
     return "subtitles='{}'".format(esc)
 
 
-def cut_clip(src, dst, cand, settings, ass_path=None):
-    """Potong satu segmen dengan ffmpeg. True bila sukses."""
+def cut_clip(src, dst, cand, settings, ass_path=None, job_dir=None,
+             idx=1):
+    """Potong satu segmen dengan ffmpeg. True bila sukses.
+
+    Jalur filter_complex dipakai bila gaming split / watermark gambar
+    aktif; selebihnya -vf biasa dengan varian cadangan (penuh, tanpa
+    overlay, polos) sehingga satu overlay gagal tak menggagalkan klip.
+    """
     teaser = cand.get("hook") if settings.get("teaser") else None
-    variants = []
-    vf = build_filter(settings["ratio"], settings["height"],
-                      teaser, settings.get("teaserSeconds", 3))
-    if ass_path:
-        vf += "," + _subtitles_filter(ass_path)
-    variants.append(vf)
-    if teaser:  # cadangan: tanpa teaser, caption tetap
-        vf2 = build_filter(settings["ratio"], settings["height"], None, 0)
+    teaser_sec = settings.get("teaserSeconds", 3)
+    title = cand.get("title") if settings.get("titleMode", "off") != "off" \
+        else None
+    ratio = settings["ratio"]
+    use_split = bool(settings.get("splitMode")) and ratio == "9:16"
+    wm_path = settings.get("watermarkImagePath")
+
+    # --- kotak crop manual / ekspresi x (face tracking / keyframe) ---
+    crop_box = None
+    cb = _box_pct(settings.get("cropBox") or {}) if settings.get("cropBox") \
+        else None
+    if cb and ratio in ("9:16", "1:1"):
+        crop_box = cb
+    x_expr = None
+    if not use_split and not crop_box and ratio in ("9:16", "1:1"):
+        cw = "ih*9/16" if ratio == "9:16" else "ih"
+        kf = settings.get("keyframes") or []
+        pts = []
+        for k in kf:
+            try:
+                pts.append((float(k["t"]), float(k["x"]) / 100.0))
+            except Exception:
+                continue
+        pts = sorted(set(pts))
+        if len(pts) >= 2:
+            x_expr = _x_expr_lerp(pts, cw)
+        elif settings.get("faceTrack") and job_dir:
+            traj = face_trajectory(src, cand["start"], cand["end"],
+                                   job_dir, idx)
+            if traj:
+                x_expr = _x_expr_from_points(traj, cw)
+
+    attempts = []
+
+    # --- percobaan filter_complex (split / watermark gambar) ---
+    if (use_split or wm_path) and not (
+            not use_split and ratio == "9:16-blur"):
+        graph = ""
+        if use_split:
+            W = int(settings["height"])
+            H = int(W * 16 / 9)
+            H -= H % 2
+            face_h = max(100, H * int(settings.get("splitFaceH", 35))
+                         // 100)
+            face_h -= face_h % 2
+            game_h = H - face_h
+            fb = _box_pct(settings.get("splitFaceBox") or {}) or \
+                (62, 68, 36, 30)
+            gb = _box_pct(settings.get("splitGameBox") or {}) or \
+                (0, 0, 100, 100)
+            fx, fy, fw, fh = fb
+            gx, gy, gw, gh = gb
+            graph += (
+                "[0:v]split=2[fs][gs];"
+                "[fs]crop=iw*{:.4f}:ih*{:.4f}:iw*{:.4f}:ih*{:.4f},"
+                "scale={}:{}:force_original_aspect_ratio=increase,"
+                "crop={}:{}[face];"
+                "[gs]crop=iw*{:.4f}:ih*{:.4f}:iw*{:.4f}:ih*{:.4f},"
+                "scale={}:{}:force_original_aspect_ratio=increase,"
+                "crop={}:{}[game];"
+            ).format(fw / 100, fh / 100, fx / 100, fy / 100,
+                     W, face_h, W, face_h,
+                     gw / 100, gh / 100, gx / 100, gy / 100,
+                     W, game_h, W, game_h)
+            if settings.get("splitFace", "bawah") == "atas":
+                graph += "[face][game]vstack[v]"
+            else:
+                graph += "[game][face]vstack[v]"
+            vid = "[v]"
+            ov = _overlay_filters(settings, teaser, teaser_sec, title)
+            if ov:
+                graph += ";[v]" + ",".join(ov) + "[v2]"
+                vid = "[v2]"
+        else:
+            vf0 = build_filter(settings, teaser, teaser_sec, title,
+                               x_expr, crop_box)
+            graph += "[0:v]" + vf0 + "[vbase]"
+            vid = "[vbase]"
         if ass_path:
-            vf2 += "," + _subtitles_filter(ass_path)
-        variants.append(vf2)
-    variants.append(build_filter(settings["ratio"], settings["height"],
-                                 None, 0))
-    for vf in variants:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", "{:.2f}".format(cand["start"]),
-            "-to", "{:.2f}".format(cand["end"]),
-            "-i", src,
-            "-vf", vf,
+            graph += ";{0}{1}[vout]".format(vid, _subtitles_filter(ass_path))
+            vid = "[vout]"
+        inputs = ["ffmpeg", "-y",
+                  "-ss", "{:.2f}".format(cand["start"]),
+                  "-to", "{:.2f}".format(cand["end"]),
+                  "-i", src]
+        if wm_path:
+            inputs += ["-i", wm_path]
+            op = max(10, min(100,
+                             int(settings.get("watermarkOpacity", 60)))) / 100.0
+            xy = {
+                "kanan-bawah": "x=W-w-20:y=H-h-20",
+                "kiri-bawah": "x=20:y=H-h-20",
+                "kanan-atas": "x=W-w-20:y=20",
+                "kiri-atas": "x=20:y=20",
+            }.get(settings.get("watermarkPos", "kanan-bawah"),
+                  "x=W-w-20:y=H-h-20")
+            graph += (";[1:v]format=rgba,colorchannelmixer=aa={op:.2f}[wm];"
+                      "{vid}[wm]overlay={xy}:format=yuv420[vfin]"
+                      ).format(op=op, vid=vid, xy=xy)
+            vid = "[vfin]"
+        attempts.append(inputs + [
+            "-filter_complex", graph,
+            "-map", vid, "-map", "0:a",
             "-c:v", "libx264", "-preset", "veryfast",
-            "-c:a", "aac", "-movflags", "+faststart",
-            dst,
-        ]
+            "-c:a", "aac", "-movflags", "+faststart", dst,
+        ])
+
+    # --- percobaan -vf biasa: penuh, tanpa overlay, polos ---
+    vf_full = build_filter(settings, teaser, teaser_sec, title,
+                           x_expr, crop_box)
+    if ass_path:
+        vf_full += "," + _subtitles_filter(ass_path)
+    attempts.append(["ffmpeg", "-y",
+                     "-ss", "{:.2f}".format(cand["start"]),
+                     "-to", "{:.2f}".format(cand["end"]),
+                     "-i", src, "-vf", vf_full,
+                     "-c:v", "libx264", "-preset", "veryfast",
+                     "-c:a", "aac", "-movflags", "+faststart", dst])
+    vf_sub = build_filter(settings, None, 0, None, x_expr, crop_box)
+    if ass_path:
+        vf_sub += "," + _subtitles_filter(ass_path)
+    attempts.append(["ffmpeg", "-y",
+                     "-ss", "{:.2f}".format(cand["start"]),
+                     "-to", "{:.2f}".format(cand["end"]),
+                     "-i", src, "-vf", vf_sub,
+                     "-c:v", "libx264", "-preset", "veryfast",
+                     "-c:a", "aac", "-movflags", "+faststart", dst])
+    vf_plain = build_filter(settings, None, 0, None, None, None)
+    attempts.append(["ffmpeg", "-y",
+                     "-ss", "{:.2f}".format(cand["start"]),
+                     "-to", "{:.2f}".format(cand["end"]),
+                     "-i", src, "-vf", vf_plain,
+                     "-c:v", "libx264", "-preset", "veryfast",
+                     "-c:a", "aac", "-movflags", "+faststart", dst])
+
+    for cmd in attempts:
         res = run_cmd(cmd, timeout=900)
         if res.returncode == 0 and os.path.exists(dst):
             return True
@@ -935,7 +1311,8 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
         set_progress(job, 40)
 
         log(job, "Membaca transkrip…")
-        segs = fetch_transcript(job, info, job_dir)
+        segs = fetch_transcript(job, info, job_dir,
+                                settings.get("sttLang", "auto"))
         stt_words = None
         if segs:
             log(job, "Transkrip ditemukan ({} segmen).".format(len(segs)))
@@ -944,7 +1321,8 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
                      "(Groq)…")
             try:
                 segs, stt_words = groq_transcribe(
-                    job, src, job_dir, groq_key, duration)
+                    job, src, job_dir, groq_key, duration,
+                    settings.get("sttLang", "auto"))
                 if segs:
                     log(job, "STT Groq selesai ({} kata).".format(
                         len(stt_words)))
@@ -962,6 +1340,28 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
         min_dur = settings["minDur"]
         max_dur = settings["maxDur"]
 
+        # --- mode manual: pakai pilihan user, lewati seleksi otomatis ---
+        manual_picked = []
+        manual_clips = settings.get("clips") or []
+        if settings.get("mode") in ("manual", "manual_ai") and manual_clips:
+            for mc in manual_clips:
+                try:
+                    s = max(0.0, float(mc.get("start", 0)))
+                    e = min(duration, float(mc.get("end", 0)))
+                except Exception:
+                    continue
+                if e - s < 3:
+                    continue
+                manual_picked.append({
+                    "start": s, "end": e,
+                    "hook": str(mc.get("hook", "") or ""),
+                    "title": str(mc.get("title", "") or ""),
+                    "desc": str(mc.get("desc", "") or ""),
+                    "score": int(mc.get("score", 50) or 50),
+                })
+            manual_picked.sort(key=lambda c: c["start"])
+        skip_auto = bool(manual_picked)
+
         heat = heatmap_peaks(info, duration, min_dur, max_dur, count)
         heat_info = ""
         if heat:
@@ -975,7 +1375,7 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
             log(job, "Data Most Replayed tidak tersedia.")
 
         candidates = []
-        if gemini_key:
+        if gemini_key and not skip_auto:
             log(job, "AI menganalisis momen…")
             candidates = gemini_candidates(
                 gemini_key, title, duration, segs, heat_info,
@@ -985,10 +1385,10 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
                 log(job, "AI memilih {} momen.".format(len(candidates)))
             else:
                 log(job, "AI tidak memberi hasil, memakai cadangan.")
-        if not candidates and heat:
+        if not skip_auto and not candidates and heat:
             candidates = heat
             log(job, "Memakai puncak Most Replayed.")
-        if not candidates:
+        if not skip_auto and not candidates:
             candidates = even_fallback(duration, count, min_dur, max_dur)
             log(job, "Memakai segmen merata sepanjang video.")
 
@@ -1002,9 +1402,12 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
             picked.append(c)
             if len(picked) >= count:
                 break
-        if settings.get("onlyHighScore"):
+        if not skip_auto and settings.get("onlyHighScore"):
             picked = [c for c in picked if c.get("score", 0) >= 70] or picked[:1]
         picked.sort(key=lambda c: c["start"])
+        if skip_auto:
+            picked = manual_picked
+            log(job, "Mode manual: {} klip dipilih.".format(len(picked)))
         if not picked:
             raise RuntimeError("Tidak ada momen yang bisa dipotong.")
         set_progress(job, 60)
@@ -1029,7 +1432,8 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
                                               words=stt_words)
                 except Exception:
                     ass_path = None
-            if not cut_clip(src, dst, cand, settings, ass_path=ass_path):
+            if not cut_clip(src, dst, cand, settings, ass_path=ass_path,
+                             job_dir=job_dir, idx=i):
                 log(job, "Klip {} gagal dipotong, dilewati.".format(i))
                 continue
             job["clips"].append({
@@ -1038,16 +1442,30 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
                 "start": round(cand["start"], 1),
                 "end": round(cand["end"], 1),
                 "hook": cand["hook"],
+                "title": cand.get("title", ""),
+                "desc": cand.get("desc", ""),
                 "score": cand.get("score", 50),
             })
             set_progress(job, 60 + int(40 * i / total))
 
         if not job["clips"]:
             raise RuntimeError("Semua klip gagal dipotong.")
+        wm_path = settings.get("watermarkImagePath")
+        if wm_path:
+            try:
+                os.remove(wm_path)
+            except OSError:
+                pass
         job["status"] = "done"
         set_progress(job, 100)
         log(job, "Selesai. {} klip dibuat.".format(len(job["clips"])))
     except Exception as e:  # noqa: BLE001
+        wm_path = settings.get("watermarkImagePath")
+        if wm_path:
+            try:
+                os.remove(wm_path)
+            except OSError:
+                pass
         job["status"] = "error"
         job["error"] = str(e)
         log(job, "Error: {}".format(e))
@@ -1553,6 +1971,87 @@ def gatecheck():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@app.post("/api/detect")
+def detect_moments():
+    """Deteksi momen (Manual+AI): info + transkrip + heatmap + Gemini
+    tanpa merender. Mengembalikan kandidat untuk dipilih user di
+    frontend; render dilakukan lewat /api/job mode manual_ai."""
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "URL video wajib diisi."}), 400
+    s = data.get("settings") or {}
+    try:
+        count = max(1, min(20, int(s.get("clipCount", 10))))
+        min_dur = max(3, int(s.get("minDur", 15)))
+        max_dur = max(5, int(s.get("maxDur", 30)))
+    except Exception:
+        return jsonify({"error": "Pengaturan durasi tidak valid."}), 400
+    audience = str(s.get("audience", ""))[:120]
+    lang = s.get("sttLang") if s.get("sttLang") in LANGS else "auto"
+    gemini_key = (data.get("geminiKey") or "").strip() or None
+    groq_key = (data.get("groqKey") or "").strip() or None
+    job = {"id": "detect", "log": [], "progress": 0,
+           "status": "running", "clips": [], "error": None}
+    try:
+        tmpdir = os.path.join(BASE_DIR, "detect_tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        info = fetch_info(job, url, tmpdir)
+        title = info.get("title") or "Video"
+        duration = float(info.get("duration") or 0)
+        if duration <= 0:
+            return jsonify({"error": "Durasi video tidak diketahui."}), 400
+        segs = fetch_transcript(job, info, tmpdir, lang)
+        if not segs and groq_key:
+            # tanpa subtitle: STT butuh berkas video, unduh sekali
+            src = download_video(job, url, tmpdir, info=info)
+            try:
+                segs, _w = groq_transcribe(job, src, tmpdir, groq_key,
+                                           duration, lang)
+            except Exception:
+                segs = []
+        heat = heatmap_peaks(info, duration, min_dur, max_dur, count)
+        heat_info = ""
+        if heat:
+            heat_info = ", ".join(
+                "{:.0f}-{:.0f} (skor {})".format(
+                    h["start"], h["end"], h["score"]) for h in heat)
+        candidates = []
+        if gemini_key:
+            candidates = gemini_candidates(
+                gemini_key, title, duration, segs, heat_info,
+                count, min_dur, max_dur, audience)
+        if not candidates and heat:
+            candidates = heat
+        if not candidates:
+            candidates = even_fallback(duration, count, min_dur, max_dur)
+        candidates.sort(key=lambda c: c.get("score", 0), reverse=True)
+        picked = []
+        for c in candidates:
+            if any(not (c["end"] <= p["start"] or c["start"] >= p["end"])
+                   for p in picked):
+                continue
+            picked.append(c)
+            if len(picked) >= count:
+                break
+        picked.sort(key=lambda c: c["start"])
+        out = []
+        for c in picked:
+            out.append({
+                "start": round(c["start"], 1),
+                "end": round(c["end"], 1),
+                "hook": c.get("hook", "") or hook_for_segment(
+                    segs, c, title),
+                "title": c.get("title", ""),
+                "desc": c.get("desc", ""),
+                "score": c.get("score", 50),
+            })
+        return jsonify({"title": title, "duration": duration,
+                        "candidates": out})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
 @app.post("/api/job")
 def create_job():
     data = request.get_json(force=True, silent=True) or {}
@@ -1560,12 +2059,50 @@ def create_job():
     if not url:
         return jsonify({"error": "URL video wajib diisi."}), 400
     s = data.get("settings") or {}
+
+    def _clamp_int(v, lo, hi, default):
+        try:
+            return max(lo, min(hi, int(v)))
+        except Exception:
+            return default
+
+    def _pct_box(d):
+        if not isinstance(d, dict):
+            return None
+        return _box_pct(d)
+
+    clips = []
+    if isinstance(s.get("clips"), list):
+        for mc in s["clips"][:20]:
+            if not isinstance(mc, dict):
+                continue
+            try:
+                clips.append({
+                    "start": float(mc.get("start", 0)),
+                    "end": float(mc.get("end", 0)),
+                    "hook": str(mc.get("hook", "") or "")[:200],
+                    "title": str(mc.get("title", "") or "")[:120],
+                    "desc": str(mc.get("desc", "") or "")[:300],
+                    "score": _clamp_int(mc.get("score", 50), 0, 100, 50),
+                })
+            except Exception:
+                continue
+    keyframes = []
+    if isinstance(s.get("keyframes"), list):
+        for k in s["keyframes"][:24]:
+            if not isinstance(k, dict):
+                continue
+            try:
+                keyframes.append({"t": float(k.get("t", 0)),
+                                  "x": float(k.get("x", 50))})
+            except Exception:
+                continue
     settings = {
         "clipCount": max(1, min(20, int(s.get("clipCount", 5)))),
         "minDur": max(3, int(s.get("minDur", 15))),
         "maxDur": max(5, int(s.get("maxDur", 30))),
         "ratio": s.get("ratio") if s.get("ratio") in
-                 ("9:16", "16:9", "1:1") else "9:16",
+                 ("9:16", "16:9", "1:1", "9:16-blur") else "9:16",
         "height": int(s.get("height", 720)) or 720,
         "audience": str(s.get("audience", ""))[:120],
         "teaser": bool(s.get("teaser", True)),
@@ -1574,6 +2111,46 @@ def create_job():
         "captions": bool(s.get("captions", True)),
         "captionStyle": s.get("captionStyle") if s.get("captionStyle") in
                         ("pop", "klasik", "kotak") else "pop",
+        # --- v1.5: mode & pilihan klip ---
+        "mode": s.get("mode") if s.get("mode") in
+                ("manual", "manual_ai") else "auto",
+        "clips": clips,
+        "keyframes": keyframes,
+        # --- v1.5: bahasa transkripsi ---
+        "sttLang": s.get("sttLang") if s.get("sttLang") in LANGS
+                    else "auto",
+        # --- v1.5: caption editor ---
+        "capColor": str(s.get("capColor", ""))[:7],
+        "capSizePct": _clamp_int(s.get("capSizePct", 100), 70, 150, 100),
+        "capChunk": _clamp_int(s.get("capChunk", 4), 1, 8, 4),
+        "capPos": s.get("capPos") if s.get("capPos") in
+                  ("bawah", "tengah", "atas") else "bawah",
+        "capGlow": bool(s.get("capGlow", False)),
+        "capBox": bool(s.get("capBox", False)),
+        # --- v1.5: judul ---
+        "titleMode": s.get("titleMode") if s.get("titleMode") in
+                      ("off", "awal", "penuh") else "off",
+        "titleStyle": s.get("titleStyle") if s.get("titleStyle") in
+                      ("bar", "teks") else "bar",
+        # --- v1.5: watermark ---
+        "watermarkText": str(s.get("watermarkText", ""))[:40],
+        "watermarkPos": s.get("watermarkPos") if s.get("watermarkPos") in
+                        ("kanan-bawah", "kiri-bawah", "kanan-atas",
+                         "kiri-atas") else "kanan-bawah",
+        "watermarkOpacity": _clamp_int(s.get("watermarkOpacity", 60),
+                                       10, 100, 60),
+        "watermarkSize": _clamp_int(s.get("watermarkSize", 28),
+                                    16, 64, 28),
+        "watermarkImagePath": None,
+        # --- v1.5: tracking / split / crop ---
+        "faceTrack": bool(s.get("faceTrack", False)),
+        "splitMode": bool(s.get("splitMode", False)),
+        "splitFace": s.get("splitFace") if s.get("splitFace") in
+                     ("atas", "bawah") else "bawah",
+        "splitFaceH": _clamp_int(s.get("splitFaceH", 35), 20, 50, 35),
+        "splitFaceBox": _pct_box(s.get("splitFaceBox") or {}),
+        "splitGameBox": _pct_box(s.get("splitGameBox") or {}),
+        "cropBox": _pct_box(s.get("cropBox") or {}),
     }
     if settings["maxDur"] < settings["minDur"]:
         settings["maxDur"] = settings["minDur"]
@@ -1582,6 +2159,29 @@ def create_job():
 
     cleanup_old_jobs()
     job = new_job()
+    # watermark gambar: simpan sekali ke /tmp, dihapus saat job selesai
+    wm_data = data.get("watermarkImage") or ""
+    if isinstance(wm_data, str) and wm_data.startswith("data:image/"):
+        try:
+            import base64
+            header, b64 = wm_data.split(",", 1)
+            raw = base64.b64decode(b64, validate=True)
+            ext = "png"
+            if "jpeg" in header or "jpg" in header:
+                ext = "jpg"
+            elif "webp" in header:
+                ext = "webp"
+            if len(raw) <= 5 * 1024 * 1024 and raw[:4] in (
+                    b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1",
+                    b"RIFF"):
+                path = os.path.join(
+                    tempfile.gettempdir(),
+                    "wm_{}.{}".format(job["id"], ext))
+                with open(path, "wb") as fh:
+                    fh.write(raw)
+                settings["watermarkImagePath"] = path
+        except Exception:
+            settings["watermarkImagePath"] = None
     t = threading.Thread(
         target=process_job, args=(job, url, gemini_key, settings, groq_key),
         daemon=True,
