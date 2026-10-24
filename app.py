@@ -1284,12 +1284,75 @@ YTDL_LOCK = threading.Lock()
 YTDL_DIR = "/tmp/ytdljobs"
 
 
+_DL_PCT = re.compile(r"(\d+(?:\.\d+)?)% of")
+_DL_FRAG = re.compile(r"[Ff]ragment\s+(\d+)\s+of\s+(\d+)")
+_DL_SPEED = re.compile(r"at\s+([0-9.]+\s*[KMG]iB/s)")
+_DL_ETA = re.compile(r"ETA\s+(?:(\d+):)?(\d+):(\d+)")
+_FF_TIME = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _run_dl_stream(args, timeout, job):
+    """Jalankan yt-dlp sambil membaca progresnya baris demi baris.
+
+    Mengisi job['progress'] (0-100), job['speed'], job['eta'] (detik)
+    secara langsung agar endpoint status bisa melaporkannya ke web —
+    inilah "klu" lamanya unduhan: persen + perkiraan sisa dari yt-dlp
+    sendiri. Mengembalikan (returncode, tail_output).
+    """
+    proc = subprocess.Popen(args + ["--newline"], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            bufsize=1)
+    tail = []
+    t0 = time.time()
+    try:
+        for line in proc.stdout:
+            tail.append(line)
+            if len(tail) > 40:
+                tail.pop(0)
+            s = line.strip()
+            m = _DL_PCT.search(s)
+            if m:
+                try:
+                    job["progress"] = round(float(m.group(1)), 1)
+                except Exception:
+                    pass
+                ms = _DL_SPEED.search(s)
+                if ms:
+                    job["speed"] = ms.group(1).replace(" ", "")
+                me = _DL_ETA.search(s)
+                if me:
+                    job["eta"] = int(me.group(1) or 0) * 3600 \
+                        + int(me.group(2)) * 60 + int(me.group(3))
+            else:
+                mf = _DL_FRAG.search(s)
+                if mf and int(mf.group(2)) > 0:
+                    job["progress"] = round(
+                        100.0 * int(mf.group(1)) / int(mf.group(2)), 1)
+                elif job.get("duration"):
+                    mt = _FF_TIME.search(s)
+                    if mt:
+                        secs = int(mt.group(1)) * 3600 \
+                            + int(mt.group(2)) * 60 + float(mt.group(3))
+                        job["progress"] = round(min(
+                            99.0, 100.0 * secs / job["duration"]), 1)
+            if timeout and time.time() - t0 > timeout:
+                proc.kill()
+                return 124, "".join(tail)
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    return proc.wait(), "".join(tail)
+
+
 def _ytdl_worker(job):
     jid = job["id"]
     jdir = os.path.join(YTDL_DIR, jid)
     os.makedirs(jdir, exist_ok=True)
     url = job["url"]
     try:
+        job["stage"] = "mengambil info video"
         base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=False)
         client = ["--extractor-args",
                   "youtube:player_client=web_safari"]
@@ -1313,15 +1376,20 @@ def _ytdl_worker(job):
                       for h in heights]
         last_err = ""
         for h, fsel in ladder:
+            job["stage"] = ("mengunduh audio" if job["mode"] == "audio"
+                            else "mengunduh {}p".format(h))
+            job["progress"] = None
+            job["speed"] = ""
+            job["eta"] = None
             args = base + client + [
                 "-f", fsel, "-o", os.path.join(jdir, "media.%(ext)s")]
             if job["mode"] == "audio":
                 args += ["-x", "--audio-format", "mp3"]
             args += [url]
-            res = run_cmd(args, timeout=1800)
+            rc, tail = _run_dl_stream(args, 1800, job)
             files = [f for f in glob.glob(os.path.join(jdir, "media.*"))
                      if ".part" not in f]
-            if res.returncode == 0 and files:
+            if rc == 0 and files:
                 job["file"] = os.path.basename(files[0])
                 if job["mode"] == "video":
                     pr = run_cmd(
@@ -1335,7 +1403,7 @@ def _ytdl_worker(job):
                         job["height"] = h or 0
                 job["status"] = "done"
                 return
-            last_err = (res.stderr or "")[-300:]
+            last_err = tail[-300:]
         raise RuntimeError("semua tangga kualitas gagal: " + last_err)
     except Exception as e:  # noqa: BLE001
         job["status"] = "error"
@@ -1357,7 +1425,9 @@ def ytdl_create():
     job = {"id": jid, "url": url, "quality": q,
            "mode": "audio" if data.get("mode") == "audio" else "video",
            "status": "running", "title": "", "duration": 0,
-           "height": 0, "file": None, "error": None}
+           "height": 0, "file": None, "error": None,
+           "stage": "antre", "progress": None, "speed": "",
+           "eta": None}
     with YTDL_LOCK:
         YTDL_JOBS[jid] = job
     threading.Thread(target=_ytdl_worker, args=(job,),
@@ -1372,7 +1442,8 @@ def ytdl_status(jid):
     if not job:
         return jsonify({"error": "tidak ditemukan"}), 404
     out = {k: job[k] for k in ("id", "status", "title", "duration",
-                               "height", "mode", "error")}
+                               "height", "mode", "error", "stage",
+                               "progress", "speed", "eta")}
     if job["status"] == "done":
         out["file_url"] = "/api/ytdl/file/" + jid
     return jsonify(out)
