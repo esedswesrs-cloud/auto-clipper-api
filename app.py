@@ -1103,6 +1103,60 @@ def debug_probe():
     mode = data.get("mode") or "info"
     tmp = tempfile.mkdtemp(prefix="probe-")
     try:
+        if mode == "instance":
+            inst = (data.get("instance") or "").rstrip("/")
+            if not inst.startswith("https://"):
+                return jsonify({"ok": False,
+                                "error": "instance tidak valid"})
+            try:
+                r = requests.post(
+                    inst + "/",
+                    json={"url": url, "videoQuality": "720"},
+                    headers={"Accept": "application/json",
+                             "Content-Type": "application/json"},
+                    timeout=60)
+                body = {}
+                try:
+                    body = r.json()
+                except Exception:
+                    pass
+                out = {"ok": False, "instance_status": r.status_code,
+                       "instance_resp": str(body)[:300]}
+                tun = body.get("url") if isinstance(body, dict) \
+                    else None
+                if body.get("status") in ("tunnel", "redirect") and tun:
+                    r2 = requests.get(
+                        tun, headers={"Range": "bytes=0-524287"},
+                        timeout=60, stream=True)
+                    out["tunnel_status"] = r2.status_code
+                    out["tunnel_bytes_head"] = len(
+                        next(r2.iter_content(65536), b""))
+                    out["ok"] = r2.status_code in (200, 206)
+                return jsonify(out)
+            except Exception as e:  # noqa: BLE001
+                return jsonify({"ok": False,
+                                "error": str(e)[:300]})
+        if mode == "shen":
+            args = ytdlp_base_args(tmp, use_cookies=True,
+                                   use_proxy=True)
+            args += ["--force-ipv4", "--extractor-args",
+                     "youtube:player_client=web,mweb,android"]
+            dst = os.path.join(tmp, "shen_out.mp4")
+            res = run_cmd(args + [
+                "-f", "best[height<=720]/best",
+                "--download-sections", "*0-20",
+                "--force-keyframes-at-cuts",
+                "-o", dst, url,
+            ], timeout=240)
+            size = (os.path.getsize(dst)
+                    if os.path.exists(dst) else 0)
+            tail = (res.stderr or res.stdout or "").strip()
+            return jsonify({
+                "ok": res.returncode == 0 and size > 100000,
+                "stage": "shen-download",
+                "bytes_written": size,
+                "tail": tail[-400:],
+            })
         if mode == "sabr":
             args = ytdlp_base_args(tmp, use_cookies=True,
                                    use_proxy=False)
