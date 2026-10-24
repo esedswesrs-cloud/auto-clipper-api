@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -129,7 +130,23 @@ def _cookies_to_netscape(content):
     return "\n".join(lines) + "\n"
 
 
-def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False):
+# Host Meta (Facebook/Instagram): kontennya menuntut sesi login, jadi
+# jalur ini memakai cookies Facebook yang terpasang di server (env
+# FB_COOKIES_FILE menunjuk ke file Netscape) — tanpa cookies, Meta
+# menyodorkan halaman kosong (cobalt: fetch.empty; yt-dlp: parse error).
+META_HOSTS = ("facebook.com", "fb.watch", "instagram.com")
+
+
+def is_meta_url(url):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in META_HOSTS)
+
+
+def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False,
+                    cookies_path=None):
     """Argumen dasar yt-dlp.
 
     - Proxy SOCKS5 (WARP via wireproxy, disiapkan start.sh) hanya
@@ -156,6 +173,8 @@ def ytdlp_base_args(job_dir, use_cookies=True, use_proxy=False):
         with open(cpath, "w", encoding="utf-8") as f:
             f.write(_cookies_to_netscape(cookies_content))
         args += ["--cookies", cpath]
+    if cookies_path:
+        args += ["--cookies", cookies_path]
     return args
 
 
@@ -1353,9 +1372,21 @@ def _ytdl_worker(job):
     url = job["url"]
     try:
         job["stage"] = "mengambil info video"
-        base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=True)
-        client = ["--extractor-args",
-                  "youtube:player_client=web_safari"]
+        meta = is_meta_url(url)
+        if meta:
+            # Meta: tanpa extractor-args YouTube, tanpa proxy (tes
+            # terbukti lolos direct), cookies dari file server.
+            fb = os.environ.get("FB_COOKIES_FILE", "").strip()
+            if not fb or not os.path.exists(fb):
+                raise RuntimeError(
+                    "cookies Facebook belum terpasang di server")
+            base = ytdlp_base_args(jdir, use_cookies=False,
+                                   use_proxy=False, cookies_path=fb)
+            client = []
+        else:
+            base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=True)
+            client = ["--extractor-args",
+                      "youtube:player_client=web_safari"]
         res = run_cmd(base + client + ["-J", "--skip-download", url],
                       timeout=120)
         if res.returncode == 0:
@@ -1367,6 +1398,11 @@ def _ytdl_worker(job):
                 pass
         if job["mode"] == "audio":
             ladder = [(0, "bestaudio/best")]
+        elif meta:
+            # Meta: tangga tinggi YouTube malah menurunkan reel
+            # vertikal (terbukti: cap 1080 -> 960, tanpa cap -> 1920);
+            # ambil format terbaik, resolusi nyata dibaca ffprobe.
+            ladder = [(0, "bv+ba/b")]
         else:
             heights = []
             for h in (job["quality"], 720, 480, 360):
@@ -1376,8 +1412,12 @@ def _ytdl_worker(job):
                       for h in heights]
         last_err = ""
         for h, fsel in ladder:
-            job["stage"] = ("mengunduh audio" if job["mode"] == "audio"
-                            else "mengunduh {}p".format(h))
+            if job["mode"] == "audio":
+                job["stage"] = "mengunduh audio"
+            elif meta:
+                job["stage"] = "mengunduh video terbaik"
+            else:
+                job["stage"] = "mengunduh {}p".format(h)
             job["progress"] = None
             job["speed"] = ""
             job["eta"] = None
@@ -1394,11 +1434,14 @@ def _ytdl_worker(job):
                 if job["mode"] == "video":
                     pr = run_cmd(
                         ["ffprobe", "-v", "error", "-select_streams",
-                         "v:0", "-show_entries", "stream=height",
+                         "v:0", "-show_entries", "stream=width,height",
                          "-of", "csv=p=0", files[0]], timeout=30)
                     try:
-                        job["height"] = int(
-                            (pr.stdout or "0").strip() or 0)
+                        parts = (pr.stdout or "").strip().split(",")
+                        w = int(parts[0]); hh = int(parts[1])
+                        # Label "p" = sisi pendek: reel vertikal
+                        # 1080x1920 -> 1080p, landscape 1920x1080 -> 1080p.
+                        job["height"] = min(w, hh) if meta else hh
                     except Exception:
                         job["height"] = h or 0
                 job["status"] = "done"
@@ -1415,8 +1458,9 @@ def ytdl_create():
     data = request.get_json(force=True, silent=True) or {}
     url = (data.get("url") or "").strip()
     if ("youtube.com/watch" not in url and "youtu.be/" not in url
-            and "youtube.com/shorts/" not in url):
-        return jsonify({"error": "url youtube tidak valid"}), 400
+            and "youtube.com/shorts/" not in url
+            and not is_meta_url(url)):
+        return jsonify({"error": "url youtube/facebook tidak valid"}), 400
     try:
         q = int(data.get("quality") or 720)
     except Exception:
