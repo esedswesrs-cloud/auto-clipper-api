@@ -1353,7 +1353,7 @@ def _ytdl_worker(job):
     url = job["url"]
     try:
         job["stage"] = "mengambil info video"
-        base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=False)
+        base = ytdlp_base_args(jdir, use_cookies=True, use_proxy=True)
         client = ["--extractor-args",
                   "youtube:player_client=web_safari"]
         res = run_cmd(base + client + ["-J", "--skip-download", url],
@@ -1484,7 +1484,7 @@ def gatecheck():
                         "detail": GATECHECK["detail"]})
     tmp = tempfile.mkdtemp(prefix="gate-")
     try:
-        base = ytdlp_base_args(tmp, use_cookies=True, use_proxy=False)
+        base = ytdlp_base_args(tmp, use_cookies=True, use_proxy=True)
         args = base + [
             "--extractor-args", "youtube:player_client=web_safari",
             "-f", "best[height<=360]/best",
