@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.7"
+APP_VER = "1.8"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -46,6 +46,82 @@ def _cors(resp):
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------- upload file (v1.8)
+UPLOAD_DIR = os.environ.get("CLIPUPLOADS_DIR", "/tmp/clipuploads")
+UPLOADS = {}
+UPLOADS_LOCK = threading.Lock()
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi",
+              ".flv", ".wmv", ".mpg", ".mpeg", ".3gp"}
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
+MAX_RULES_CHARS = 12000
+
+
+def cleanup_old_uploads():
+    """Hapus berkas upload yang berumur > 2 jam (oportunistik)."""
+    try:
+        now = time.time()
+        with UPLOADS_LOCK:
+            stale = [fid for fid, u in UPLOADS.items()
+                     if now - u.get("created", 0) > 2 * 3600]
+            for fid in stale:
+                del UPLOADS[fid]
+        if os.path.isdir(UPLOAD_DIR):
+            for name in os.listdir(UPLOAD_DIR):
+                path = os.path.join(UPLOAD_DIR, name)
+                if (os.path.isfile(path)
+                        and now - os.path.getmtime(path) > 2 * 3600):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+
+def probe_duration(src):
+    """Durasi video lokal via ffprobe (detik, float)."""
+    res = run_cmd(["ffprobe", "-v", "quiet", "-print_format", "json",
+                   "-show_format", src], timeout=60)
+    try:
+        data = json.loads(res.stdout or "{}")
+        return float(data.get("format", {}).get("duration") or 0)
+    except Exception:
+        return 0.0
+
+
+def extract_pdf_text(path):
+    """Ambil teks dari PDF. Coba pypdf -> PyPDF2 -> pdftotext.
+    Mengembalikan teks; raise RuntimeError bila tak ada pengekstrak
+    atau PDF tak berisi teks (mis. hasil scan)."""
+    text = ""
+    PdfReader = None
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader
+        except Exception:
+            PdfReader = None
+    if PdfReader is not None:
+        reader = PdfReader(path)
+        parts = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        text = "\n".join(parts).strip()
+    else:
+        res = run_cmd(["pdftotext", "-layout", path, "-"], timeout=120)
+        if res.returncode == 0:
+            text = (res.stdout or "").strip()
+    if not text:
+        raise RuntimeError(
+            "PDF tidak berisi teks yang bisa dibaca "
+            "(mungkin hasil scan/gambar). Tempel aturannya sebagai teks.")
+    return text
 
 
 # ---------------------------------------------------------------- util dasar
@@ -690,6 +766,90 @@ def gemini_candidates(api_key, title, duration, segs, heat_info,
         return out
     except Exception:
         return []
+
+
+def gemini_metadata(api_key, title, segs, clips, rules):
+    """Buatkan metadata posting per klip (judul YT, judul singkat,
+    deskripsi, tag). Bila rules ada -> ikuti aturan campaign itu;
+    bila tidak -> auto-generate standar dari isi klip.
+    Satu panggilan untuk semua klip. Balas list dict sejajar clips."""
+    if not api_key or not clips:
+        return [{} for _ in clips]
+    ctx_lines = []
+    for i, c in enumerate(clips, start=1):
+        s, e = float(c["start"]), float(c["end"])
+        words = []
+        total = 0
+        for sg in segs:
+            if sg["end"] < s or sg["start"] > e:
+                continue
+            total += len(sg["text"])
+            if total > 1500:
+                break
+            words.append(sg["text"])
+        isi = " ".join(words).strip() or "(tanpa transkrip)"
+        ctx_lines.append(
+            "Klip {} ({}-{} dtk) — hook: {} | judul sementara: {} | "
+            "isi: {}".format(
+                i, int(s), int(e), c.get("hook", "") or "-",
+                c.get("title", "") or "-", isi))
+    if rules:
+        tugas = (
+            "Ini klip untuk sebuah CAMPAIGN berbayar. Aturan campaign "
+            "di bawah WAJIB diikuti kata per kata: hashtag wajib, link "
+            "wajib, format judul, kata yang wajib/terlarang, atribusi, "
+            "dan batasan lainnya. Bila aturan bertentangan dengan gaya "
+            "biasa, aturan menang.\n"
+            "ATURAN CAMPAIGN:\n{}\n".format(rules))
+    else:
+        tugas = (
+            "Buat metadata posting yang menarik dan SEO-friendly "
+            "berdasarkan isi tiap klip.\n")
+    prompt = (
+        "Kamu adalah asisten posting video. Video berjudul \"{title}\".\n"
+        "{tugas}\n"
+        "Daftar klip:\n{ctx}\n\n"
+        "Untuk SETIAP klip balas HANYA JSON murni berupa array objek "
+        "sejajar urutan klip, tanpa teks lain, format:\n"
+        '[{{"title_yt": "Judul YouTube (maks 100 karakter)", '
+        '"title_short": "Judul singkat TikTok/IG/FB (maks 80 karakter)", '
+        '"description": "Deskripsi posting lengkap 2-4 kalimat, sertakan '
+        'hashtag dan link wajib dari aturan bila ada", '
+        '"tags": "tag1, tag2, tag3 (maks 15 tag, pisah koma)"}}]\n'
+        "title_yt = judul panjang gaya YouTube. title_short = judul "
+        "pendek gaya TikTok/Reels. description = deskripsi siap posting. "
+        "tags = tag dipisah koma (string, bukan array)."
+    ).format(title=title, tugas=tugas, ctx="\n".join(ctx_lines))
+    try:
+        r = requests.post(
+            GEMINI_URL,
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": api_key},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=180,
+        )
+        r.raise_for_status()
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+        arr = json.loads(text)
+        out = []
+        for item in arr:
+            tags = item.get("tags", "")
+            if isinstance(tags, list):
+                tags = ", ".join(str(t) for t in tags)
+            out.append({
+                "title_yt": str(item.get("title_yt", "")).strip()[:100],
+                "title_short": str(item.get("title_short", "")).strip()[:80],
+                "description": str(item.get("description", "")).strip()[:2000],
+                "tags": str(tags).strip()[:500],
+            })
+        while len(out) < len(clips):
+            out.append({})
+        return out[:len(clips)]
+    except Exception:
+        return [{} for _ in clips]
 
 
 def even_fallback(duration, count, min_dur, max_dur):
@@ -1350,7 +1510,8 @@ def cut_clip(src, dst, cand, settings, ass_path=None, job_dir=None,
 
 
 # ---------------------------------------------------------------- pipeline
-def process_job(job, url, gemini_key, settings, groq_key=None):
+def process_job(job, url, gemini_key, settings, groq_key=None,
+                source=None):
     job_dir = os.path.join(BASE_DIR, job["id"])
     os.makedirs(job_dir, exist_ok=True)
     try:
@@ -1358,19 +1519,32 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
         log(job, "Memulai proses…")
         set_progress(job, 5)
 
-        log(job, "Mengambil info video…")
-        info = fetch_info(job, url, job_dir)
-        title = info.get("title") or "Video"
-        duration = float(info.get("duration") or 0)
-        if duration <= 0:
-            raise RuntimeError("Durasi video tidak diketahui.")
-        log(job, "Judul: {}".format(title))
-        log(job, "Durasi: {:.0f} detik".format(duration))
-        set_progress(job, 15)
+        if source and source.get("type") == "file":
+            src = source["path"]
+            title = source.get("title") or "Video"
+            duration = probe_duration(src)
+            if duration <= 0:
+                raise RuntimeError("Durasi file tidak bisa dibaca.")
+            info = {"title": title, "duration": duration}
+            log(job, "Sumber: file upload ({})".format(
+                source.get("filename") or title))
+            log(job, "Judul: {}".format(title))
+            log(job, "Durasi: {:.0f} detik".format(duration))
+            set_progress(job, 40)
+        else:
+            log(job, "Mengambil info video…")
+            info = fetch_info(job, url, job_dir)
+            title = info.get("title") or "Video"
+            duration = float(info.get("duration") or 0)
+            if duration <= 0:
+                raise RuntimeError("Durasi video tidak diketahui.")
+            log(job, "Judul: {}".format(title))
+            log(job, "Durasi: {:.0f} detik".format(duration))
+            set_progress(job, 15)
 
-        log(job, "Mengunduh video…")
-        src = download_video(job, url, job_dir, info=info)
-        set_progress(job, 40)
+            log(job, "Mengunduh video…")
+            src = download_video(job, url, job_dir, info=info)
+            set_progress(job, 40)
 
         log(job, "Membaca transkrip…")
         segs = fetch_transcript(job, info, job_dir,
@@ -1509,6 +1683,28 @@ def process_job(job, url, gemini_key, settings, groq_key=None):
                 "score": cand.get("score", 50),
             })
             set_progress(job, 60 + int(40 * i / total))
+
+        # --- v1.8: metadata posting per klip (campaign / standar) ---
+        if gemini_key and job["clips"]:
+            rules = (settings.get("campaignRules") or "").strip()
+            try:
+                log(job, "AI membuat metadata posting"
+                         + (" (mode Campaign)…" if rules else "…"))
+                metas = gemini_metadata(
+                    gemini_key, title, segs,
+                    [{"start": c["start"], "end": c["end"],
+                      "hook": c.get("hook", ""),
+                      "title": c.get("title", ""),
+                      "desc": c.get("desc", "")}
+                     for c in job["clips"]], rules)
+                for c, m in zip(job["clips"], metas):
+                    c["meta"] = m or {}
+                log(job, "Metadata posting siap.")
+            except Exception as e:  # noqa: BLE001
+                log(job, "Metadata posting gagal ({}); klip tetap "
+                         "tersedia.".format(e))
+        elif job["clips"]:
+            log(job, "Metadata posting dilewati (tanpa kunci Gemini).")
 
         if not job["clips"]:
             raise RuntimeError("Semua klip gagal dipotong.")
@@ -2043,7 +2239,19 @@ def detect_moments():
     frontend; render dilakukan lewat /api/job mode manual_ai."""
     data = request.get_json(force=True, silent=True) or {}
     url = (data.get("url") or "").strip()
-    if not url:
+    # --- v1.8: sumber bisa link URL (lama) atau file upload ---
+    source = data.get("source") or {}
+    file_id = None
+    up = None
+    if source.get("type") == "file":
+        file_id = str(source.get("fileId") or "").strip()
+        with UPLOADS_LOCK:
+            up = UPLOADS.get(file_id)
+        if not up or not os.path.isfile(up["path"]):
+            return jsonify({"error": "File upload tidak ditemukan atau "
+                            "sudah kedaluwarsa. Upload ulang."}), 400
+        url = ""
+    elif not url:
         return jsonify({"error": "URL video wajib diisi."}), 400
     s = data.get("settings") or {}
     try:
@@ -2061,15 +2269,27 @@ def detect_moments():
     try:
         tmpdir = os.path.join(BASE_DIR, "detect_tmp")
         os.makedirs(tmpdir, exist_ok=True)
-        info = fetch_info(job, url, tmpdir)
-        title = info.get("title") or "Video"
-        duration = float(info.get("duration") or 0)
-        if duration <= 0:
-            return jsonify({"error": "Durasi video tidak diketahui."}), 400
-        segs = fetch_transcript(job, info, tmpdir, lang)
+        if up:
+            src = up["path"]
+            title = os.path.splitext(up["filename"])[0] or "Video"
+            duration = probe_duration(src)
+            if duration <= 0:
+                return jsonify({"error": "Durasi file tidak bisa "
+                                "dibaca."}), 400
+            info = {"title": title, "duration": duration}
+            segs = []
+        else:
+            info = fetch_info(job, url, tmpdir)
+            title = info.get("title") or "Video"
+            duration = float(info.get("duration") or 0)
+            if duration <= 0:
+                return jsonify({"error": "Durasi video tidak "
+                                "diketahui."}), 400
+            segs = fetch_transcript(job, info, tmpdir, lang)
         if not segs and groq_key:
-            # tanpa subtitle: STT butuh berkas video, unduh sekali
-            src = download_video(job, url, tmpdir, info=info)
+            # tanpa subtitle: STT butuh berkas video
+            if not up:
+                src = download_video(job, url, tmpdir, info=info)
             try:
                 segs, _w = groq_transcribe(job, src, tmpdir, groq_key,
                                            duration, lang)
@@ -2117,11 +2337,98 @@ def detect_moments():
         return jsonify({"error": str(e)}), 500
 
 
+@app.post("/api/upload")
+def upload_file():
+    """Upload file video (sumber klip) atau file aturan campaign
+    (PDF/TXT/MD -> teks). Form-data: file + kind (video|rules)."""
+    kind = (request.form.get("kind") or "video").strip()
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        return jsonify({"error": "Tidak ada file yang diunggah."}), 400
+    filename = os.path.basename(f.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if kind == "rules":
+        if ext not in (".pdf", ".txt", ".md"):
+            return jsonify({"error": "File aturan harus PDF, TXT, "
+                            "atau MD."}), 400
+        cleanup_old_uploads()
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "rules_{}.{}".format(uuid.uuid4().hex[:12],
+                                                ext.lstrip(".")))
+        try:
+            f.save(tmp)
+            if os.path.getsize(tmp) > 10 * 1024 * 1024:
+                return jsonify({"error": "File aturan maks 10MB."}), 400
+            if ext == ".pdf":
+                text = extract_pdf_text(tmp)
+            else:
+                with open(tmp, "r", encoding="utf-8",
+                          errors="ignore") as fh:
+                    text = fh.read()
+            text = text.strip()[:MAX_RULES_CHARS]
+            if not text:
+                return jsonify({"error": "File aturan kosong."}), 400
+            return jsonify({"text": text})
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": "Gagal membaca file aturan: "
+                            "{}".format(e)}), 400
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    # kind == video
+    if ext not in VIDEO_EXTS:
+        return jsonify({"error": "Format video tidak didukung "
+                        "({}).".format(ext or "?")}), 400
+    cleanup_old_uploads()
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    fid = uuid.uuid4().hex[:12]
+    path = os.path.join(UPLOAD_DIR, fid + ext)
+    try:
+        f.save(path)
+        size = os.path.getsize(path)
+        if size > MAX_UPLOAD_BYTES:
+            os.remove(path)
+            return jsonify({"error": "Video maks 1 GB."}), 400
+        if size == 0:
+            os.remove(path)
+            return jsonify({"error": "File video kosong."}), 400
+        duration = probe_duration(path)
+        with UPLOADS_LOCK:
+            UPLOADS[fid] = {"path": path, "filename": filename,
+                            "size": size, "duration": duration,
+                            "created": time.time()}
+        return jsonify({"fileId": fid, "filename": filename,
+                        "size": size, "duration": duration})
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return jsonify({"error": "Gagal menyimpan video: "
+                        "{}".format(e)}), 400
+
+
 @app.post("/api/job")
 def create_job():
     data = request.get_json(force=True, silent=True) or {}
     url = (data.get("url") or "").strip()
-    if not url:
+    # --- v1.8: sumber bisa link URL (lama) atau file upload ---
+    source = data.get("source") or {}
+    file_id = None
+    up = None
+    if source.get("type") == "file":
+        file_id = str(source.get("fileId") or "").strip()
+        with UPLOADS_LOCK:
+            up = UPLOADS.get(file_id)
+        if not up or not os.path.isfile(up["path"]):
+            return jsonify({"error": "File upload tidak ditemukan atau "
+                            "sudah kedaluwarsa. Upload ulang."}), 400
+        url = ""
+    elif not url:
         return jsonify({"error": "URL video wajib diisi."}), 400
     s = data.get("settings") or {}
 
@@ -2216,6 +2523,9 @@ def create_job():
         "splitFaceBox": _pct_box(s.get("splitFaceBox") or {}),
         "splitGameBox": _pct_box(s.get("splitGameBox") or {}),
         "cropBox": _pct_box(s.get("cropBox") or {}),
+        # --- v1.8: mode Campaign ---
+        "campaignMode": bool(s.get("campaignMode", False)),
+        "campaignRules": str(s.get("campaignRules", "") or "")[:8000],
     }
     if settings["maxDur"] < settings["minDur"]:
         settings["maxDur"] = settings["minDur"]
@@ -2223,6 +2533,7 @@ def create_job():
     groq_key = (data.get("groqKey") or "").strip() or None
 
     cleanup_old_jobs()
+    cleanup_old_uploads()
     job = new_job()
     # watermark gambar: simpan sekali ke /tmp, dihapus saat job selesai
     wm_data = data.get("watermarkImage") or ""
@@ -2247,8 +2558,14 @@ def create_job():
                 settings["watermarkImagePath"] = path
         except Exception:
             settings["watermarkImagePath"] = None
+    src = None
+    if file_id and up:
+        src = {"type": "file", "path": up["path"],
+               "filename": up["filename"],
+               "title": os.path.splitext(up["filename"])[0] or "Video"}
     t = threading.Thread(
-        target=process_job, args=(job, url, gemini_key, settings, groq_key),
+        target=process_job,
+        args=(job, url, gemini_key, settings, groq_key, src),
         daemon=True,
     )
     t.start()
