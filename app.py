@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.5"
+APP_VER = "1.6"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -201,6 +201,12 @@ ATTEMPTS = [
 ]
 
 
+# Jalur Meta (Facebook/Instagram): satu percobaan langsung, tanpa
+# extractor-args YouTube dan tanpa proxy — resep jembatan yang terbukti
+# (cookies dari file server FB_COOKIES_FILE).
+META_ATTEMPTS = [(None, False)]
+
+
 def _is_bot_error(text):
     t = (text or "").lower()
     return "sign in to confirm" in t or "not a bot" in t
@@ -217,20 +223,32 @@ def _is_retryable(text):
 
 
 def run_ytdlp(job, job_dir, tail_args, timeout, errlabel, verbose=False,
-              attempts=None, use_proxy=False):
+              attempts=None, use_proxy=False, meta=False):
     """Jalankan yt-dlp melewati daftar percobaan (klien, pakai cookies).
 
     Error apa pun -> percobaan berikutnya. verbose=True menyaring
     baris terkait PO Token dari stderr ke log (diagnosis bgutil).
     Percobaan yang menang dicatat di job["win_attempt"].
+    meta=True: jalur Meta (Facebook/Instagram) — satu percobaan
+    langsung dengan cookies Facebook dari file server, tanpa
+    extractor-args YouTube dan tanpa proxy.
     """
     last_tail = "kesalahan tidak diketahui"
+    cookies_path = None
+    if meta:
+        fb = os.environ.get("FB_COOKIES_FILE", "").strip()
+        if not fb or not os.path.exists(fb):
+            raise RuntimeError(
+                "cookies Facebook belum terpasang di server")
+        attempts = META_ATTEMPTS
+        cookies_path = fb
     for client, use_cookies in (attempts or ATTEMPTS):
         if use_cookies and not os.environ.get(
                 "YOUTUBE_COOKIES", "").strip():
             continue
         args = ytdlp_base_args(job_dir, use_cookies=use_cookies,
-                               use_proxy=use_proxy)
+                               use_proxy=use_proxy,
+                               cookies_path=cookies_path)
         if verbose:
             args += ["--verbose"]
         if client:
@@ -269,7 +287,7 @@ def fetch_info(job, url, job_dir):
     """Ambil metadata video (judul, durasi, heatmap) tanpa mengunduh."""
     res = run_ytdlp(job, job_dir, ["-J", url], timeout=180,
                     errlabel="yt-dlp gagal mengambil info video",
-                    verbose=True)
+                    verbose=True, meta=is_meta_url(url))
     info = json.loads(res.stdout)
     return info
 
@@ -476,6 +494,7 @@ def _download_from_info(job, info, job_dir):
 
 
 def download_video(job, url, job_dir, info=None):
+    meta = is_meta_url(url)
     # Cara utama: unduh langsung dari URL info yang sukses.
     if info:
         try:
@@ -499,12 +518,15 @@ def download_video(job, url, job_dir, info=None):
         "-o", out,
         url,
     ]
-    # Langsung (sesi-konsisten + impersonate) didahulukan; WARP cadangan.
+    # Langsung (sesi-konsisten + impersonate) didahulukan; WARP cadangan
+    # (bukan untuk Meta: resep jembatan terbukti lolos direct).
     try:
         run_ytdlp(job, job_dir, tail, timeout=1200,
                   errlabel="yt-dlp gagal mengunduh video (langsung)",
-                  attempts=attempts, use_proxy=False)
+                  attempts=attempts, use_proxy=False, meta=meta)
     except RuntimeError:
+        if meta:
+            raise
         log(job, "Jalur langsung gagal total, coba lewat WARP…")
         run_ytdlp(job, job_dir, tail, timeout=1200,
                   errlabel="yt-dlp gagal mengunduh video",
