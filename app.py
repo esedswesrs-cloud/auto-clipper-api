@@ -16,12 +16,13 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-APP_VER = "1.8"
+APP_VER = "1.9"
 BASE_DIR = os.environ.get("CLIPJOBS_DIR", "/tmp/clipjobs")
 # Proxy egress untuk YouTube (WARP via wireproxy, disiapkan start.sh).
 # Set env CLIP_PROXY="" untuk mematikan.
@@ -46,6 +47,105 @@ def _cors(resp):
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------- statistik global (v1.9)
+# Penghitung kunjungan + unduhan sukses per situs, dipakai frontend statis
+# (Downloader dkk.) sebagai ganti backend khusus. Disimpan di file JSON di
+# home box (persisten). Frontend HANYA memanggil URL box ini — JANGAN
+# Render: disk Render ephemeral, hitungannya reset tiap deploy.
+# "Pengguna" = jumlah UID browser berbeda (localStorage per pengunjung);
+# "Download sukses" = ekstraksi berhasil (tombol unduh sudah tampil),
+# sama maknanya dengan angka Zeta. Grafik = 14 hari terakhir.
+STATS_FILE = os.environ.get("CLIP_STATS_FILE",
+                            os.path.join(os.path.expanduser("~"),
+                                         "clipper", "stats.json"))
+STATS_LOCK = threading.Lock()
+_WIB = timezone(timedelta(hours=7))  # tanggal harian ikut WIB (zona user)
+_STATS_MAX_USERS = 200000
+
+
+def _stats_today():
+    return datetime.now(_WIB).strftime("%Y-%m-%d")
+
+
+def _stats_load():
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("sites"), dict):
+            return d
+    except Exception:
+        pass
+    return {"sites": {}}
+
+
+def _stats_save(d):
+    try:
+        os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, STATS_FILE)
+    except Exception:
+        pass
+
+
+def _stats_site(d, site):
+    s = d["sites"].get(site)
+    if not isinstance(s, dict):
+        s = {"users": {}, "downloads": 0, "days": {}}
+        d["sites"][site] = s
+    s.setdefault("users", {})
+    s.setdefault("downloads", 0)
+    s.setdefault("days", {})
+    return s
+
+
+@app.route("/api/stats", methods=["GET"])
+def stats_get():
+    site = (request.args.get("site") or "downloader").strip().lower()[:32]
+    with STATS_LOCK:
+        d = _stats_load()
+        s = _stats_site(d, site)
+        days = []
+        for i in range(13, -1, -1):
+            day = (datetime.now(_WIB) - timedelta(days=i)).strftime("%Y-%m-%d")
+            b = s["days"].get(day) or {}
+            days.append({"date": day, "users": int(b.get("users", 0)),
+                         "downloads": int(b.get("downloads", 0))})
+        return jsonify({"status": True, "site": site,
+                        "users": len(s["users"]),
+                        "downloads": int(s["downloads"]), "days": days})
+
+
+@app.route("/api/stats/hit", methods=["POST"])
+def stats_hit():
+    try:
+        j = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        j = {}
+    site = str(j.get("site") or "downloader").strip().lower()[:32]
+    typ = str(j.get("type") or "visit").strip().lower()
+    uid = str(j.get("uid") or "")[:64]
+    if typ not in ("visit", "download") or not site.replace("-", "").isalnum():
+        return jsonify({"status": False, "error": "bad request"}), 400
+    today = _stats_today()
+    with STATS_LOCK:
+        d = _stats_load()
+        s = _stats_site(d, site)
+        day = s["days"].setdefault(today, {"users": 0, "downloads": 0})
+        if typ == "visit" and uid:
+            if uid not in s["users"] and len(s["users"]) < _STATS_MAX_USERS:
+                s["users"][uid] = today
+                day["users"] = int(day.get("users", 0)) + 1
+        elif typ == "download":
+            s["downloads"] = int(s["downloads"]) + 1
+            day["downloads"] = int(day.get("downloads", 0)) + 1
+        _stats_save(d)
+        return jsonify({"status": True, "site": site,
+                        "users": len(s["users"]),
+                        "downloads": int(s["downloads"])})
 
 
 # ---------------------------------------------------------------- upload file (v1.8)
